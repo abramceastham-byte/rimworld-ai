@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from rimagent.rimapi import GameState, RimApiClient, RimApiError
 from rimagent.runlog import RunLogger
@@ -37,19 +37,11 @@ def build_prompt(state: GameState) -> str:
 
 
 def parse_decision(reply: str) -> Decision:
-    """Turn the model's raw reply into a Decision, falling back to "wait".
-
-    TODO 1: Replace the line below.
-      - Decision.model_validate_json(reply) turns a JSON string into a Decision.
-        It raises pydantic.ValidationError if the JSON is broken OR the action
-        isn't one of the allowed ones.
-      - Wrap it in try/except ValidationError, and in the except branch
-        return Decision(action="wait", reason="could not parse reply").
-      - Import ValidationError from pydantic at the top of the file.
-    Test it: make_fake_model(["not json", '{"action": "dance"}']) should
-    give you two "wait" decisions instead of a crash.
-    """
-    return Decision(action="wait", reason="parse_decision not written yet")
+    """Turn the model's raw reply into a Decision, falling back to "wait"."""    
+    try:
+        return Decision.model_validate_json(reply)
+    except ValidationError:
+        return Decision(action="wait", reason="could not parse reply")
 
 
 def run(
@@ -61,11 +53,11 @@ def run(
 ) -> None:
     """Run the agent loop for max_steps steps."""
 
-    # TODO 2: Fill in this table so each action name maps to a function
-    # that performs it. "wait" should do nothing: use `lambda: None`.
-    # Example entry:  "pause": client.pause,
     actions: dict[str, Callable[[], None]] = {
         "wait": lambda: None,
+        "pause": client.pause,
+        "resume": client.resume,
+        
     }
 
     try:
@@ -80,15 +72,20 @@ def run(
             logger.log_state(state)
             prompt = build_prompt(state)
 
-            # TODO 3: Decide and act. Replace the placeholder line below with:
-            #   a. reply = model(prompt)                  ask the model
-            #   b. decision = parse_decision(reply)       make it safe
-            #   c. look up actions[decision.action] and call it, inside
-            #      try/except RimApiError so a failed action doesn't end the run
-            #   d. logger.log_decision({...}) with the step, the raw reply,
-            #      decision.action and decision.reason, so you can debug later
-            decision = Decision(action="wait", reason="loop not finished yet")
-
+            reply = model(prompt)
+            decision = parse_decision(reply)
+            try:
+                actions[decision.action]()
+            except RimApiError:
+                print(f"Step {step}: failed to {decision.action}")
+            logger.log_decision(
+                {
+                    "step": step,
+                    "reply": reply,
+                    "action": decision.action,
+                    "reason": decision.reason,
+                }
+            )
             print(f"Step {step}: {decision.action} ({decision.reason})")
             time.sleep(step_seconds)
     finally:
