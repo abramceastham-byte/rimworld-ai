@@ -37,6 +37,10 @@ class RunLogger:
         """Record a game state snapshot (a GameState or any JSON-friendly value)."""
         self._write("state", state)
 
+    def log_event(self, event: Any) -> None:
+        """Record a letter or message the game sent (a GameEvent or dict)."""
+        self._write("event", event)
+
     def log_decision(self, decision: Any) -> None:
         """Record what the model decided (raw text, a dict, or a pydantic model)."""
         self._write("decision", decision)

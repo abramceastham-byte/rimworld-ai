@@ -74,6 +74,24 @@ class Weather(BaseModel):
     temperature_c: float  # RIMAPI reports Celsius
 
 
+# What a hostile group's RimWorld "lord job" means, in plain words.
+# Names checked against RimWorld 1.6's own code. Unknown ones fall back to the raw name.
+THREAT_BEHAVIOURS = {
+    "LordJob_AssaultColony": "attacking the colony",
+    "LordJob_BossgroupAssaultColony": "attacking the colony",
+    "LordJob_StageThenAttack": "gathering at the map edge, about to attack",
+    "LordJob_Siege": "building a siege camp to bombard the colony",
+    "LordJob_SleepThenAssaultColony": "asleep; will attack the colony when woken",
+    "LordJob_SleepThenMechanoidsDefend": "asleep; will only fight if disturbed",
+    "LordJob_MechanoidsDefend": "guarding their position",
+    "LordJob_DefendAndExpandHive": "an insect hive that grows and defends itself",
+    "LordJob_Kidnap": "trying to carry off a colonist",
+    "LordJob_Steal": "trying to steal items",
+    "LordJob_ExitMapBest": "leaving the map",
+    "LordJob_ExitMapNear": "leaving the map",
+}
+
+
 class Threat(BaseModel):
     """A group on the map belonging to a hostile faction (raid, mech cluster, ...)."""
 
@@ -83,6 +101,14 @@ class Threat(BaseModel):
     current_step: str      # e.g. LordToil_Sleep for a dormant mech cluster
     pawn_count: int
     active: bool           # False while e.g. a mech cluster is still asleep
+
+    def summary(self) -> str:
+        """One line for a prompt, clearly separating live threats from dormant ones."""
+        what = THREAT_BEHAVIOURS.get(self.behaviour, self.behaviour)
+        group = f"{self.pawn_count} {self.faction_type} ({self.faction_name})"
+        if self.active:
+            return f"ACTIVE THREAT: {group}, {what}."
+        return f"Dormant, not attacking yet: {group}, {what}."
 
 
 class NewGameOptions(BaseModel):
@@ -217,6 +243,14 @@ class RimApiClient:
         return threats
 
     # --- Acting on the colony ------------------------------------------------
+
+    def enable_work(self, colonist_id: int, work_type: str) -> None:
+        """Let a colonist do this kind of work."""
+        self.set_work_priority(colonist_id, work_type, 3)
+
+    def disable_work(self, colonist_id: int, work_type: str) -> None:
+        """Stop a colonist doing this kind of work."""
+        self.set_work_priority(colonist_id, work_type, 0)
 
     def set_work_priority(self, colonist_id: int, work_type: str, priority: int) -> None:
         """Set how much a colonist prioritises a type of work.
