@@ -18,7 +18,7 @@ def main() -> int:
             state = client.get_state()
             print(f"Connected. Tick {state.game_tick}, {state.colonist_count} colonists, "
                   f"storyteller {state.storyteller}, paused={state.is_paused}")
-            if getattr(state, "map_count", 1) == 0:
+            if state.map_count == 0:
                 print("FAIL: RIMAPI is up but no colony is loaded. Load a save or start "
                       "a colony, then retry.")
                 return 1

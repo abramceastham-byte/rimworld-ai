@@ -7,7 +7,7 @@ The agent loop itself lives elsewhere; this repo provides:
 | File | What it does |
 |------|--------------|
 | `rimagent/config.py` | Reads `OLLAMA_HOST` and `RIMAPI_URL` from the environment / `.env` |
-| `rimagent/rimapi.py` | RIMAPI client: `get_state()`, `pause()`, `resume()` |
+| `rimagent/rimapi.py` | RIMAPI client: `get_state()`, `pause()`, `resume()`, `start_game()` |
 | `rimagent/fake_model.py` | Fake model returning canned answers, for offline testing |
 | `rimagent/runlog.py` | Writes state snapshots and decisions as JSON lines in `logs/` |
 | `scripts/smoke_test.py` | Reads state, pauses, resumes a live game |
@@ -27,9 +27,11 @@ Edit `.env` if your addresses differ from the defaults. It is not committed.
 
 ## Smoke test
 
-1. Start RimWorld with RIMAPI enabled and load a colony. RIMAPI listens on
+1. In RimWorld, turn on **Options > General > Run in background**. Without it the
+   game stops updating when its window loses focus, and every API request hangs.
+2. Start RimWorld with RIMAPI enabled and load a colony. RIMAPI listens on
    `http://localhost:8765` by default (the port is configurable in the mod settings).
-2. From the repo root, run:
+3. From the repo root, run:
 
 ```powershell
 python -m scripts.smoke_test
@@ -37,6 +39,25 @@ python -m scripts.smoke_test
 
 It prints the colony's tick, colonist count and storyteller, then pauses and
 resumes the game, checking each step took effect.
+
+## Starting a new colony from code
+
+`start_game()` starts a fresh game (replacing any loaded one) and waits until
+the colony is playable. RIMAPI always uses the Crashlanded scenario and its
+generated colonists; you can choose the storyteller, difficulty, world
+settings and landing tile:
+
+```python
+from rimagent.rimapi import RimApiClient, NewGameOptions
+
+with RimApiClient() as client:
+    state = client.start_game(NewGameOptions(
+        storyteller_name="Randy",
+        difficulty_name="Medium",   # Peaceful, Easy, Medium, Rough, Hard, Extreme
+        world_seed="myseed",
+        starting_tile=None,         # None = random tile
+    ))
+```
 
 ## Running the model on a lab machine (SSH tunnel)
 
