@@ -9,7 +9,7 @@ import time
 
 import httpx
 
-from rimagent.rimapi import RimApiClient
+from rimagent.rimapi import RimApiClient, RimApiError
 
 
 def main() -> int:
@@ -18,6 +18,10 @@ def main() -> int:
             state = client.get_state()
             print(f"Connected. Tick {state.game_tick}, {state.colonist_count} colonists, "
                   f"storyteller {state.storyteller}, paused={state.is_paused}")
+            if getattr(state, "map_count", 1) == 0:
+                print("FAIL: RIMAPI is up but no colony is loaded. Load a save or start "
+                      "a colony, then retry.")
+                return 1
 
             client.pause()
             time.sleep(0.5)
@@ -35,6 +39,14 @@ def main() -> int:
     except httpx.ConnectError:
         print("FAIL: could not reach RIMAPI. Is RimWorld running with the mod enabled "
               "and a colony loaded? Check RIMAPI_URL in .env.")
+        return 1
+    except RimApiError as e:
+        print(f"FAIL: {e}")
+        return 1
+    except httpx.TimeoutException:
+        print("FAIL: RIMAPI accepted the connection but did not answer. RimWorld stops "
+              "updating when its window is unfocused; turn on Options > General > "
+              "'Run in background', or click into the game window and retry.")
         return 1
 
     print("Smoke test passed.")

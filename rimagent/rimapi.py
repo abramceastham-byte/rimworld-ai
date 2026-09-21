@@ -47,10 +47,18 @@ class RimApiClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         response = self._http.request(method, path, **kwargs)
-        response.raise_for_status()
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError:
+            # Not a RIMAPI envelope (e.g. a plain HTML error page).
+            response.raise_for_status()
+            raise RimApiError(f"{method} {path} returned non-JSON: {response.text[:200]}")
+        # RIMAPI puts its reason in "errors" even on HTTP 500, so prefer that
+        # over a generic status-code error.
         if not body.get("success", False):
-            raise RimApiError(f"{method} {path} failed: {body.get('errors')}")
+            raise RimApiError(
+                f"{method} {path} failed (HTTP {response.status_code}): {body.get('errors')}"
+            )
         return body.get("data")
 
     def get_state(self) -> GameState:
