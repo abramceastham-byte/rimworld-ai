@@ -34,6 +34,57 @@ class GameState(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class Alert(BaseModel):
+    """One of the alerts on the right side of the screen, e.g. "Need colonist beds"."""
+
+    label: str
+    explanation: str = ""
+    priority: str = ""  # "High", "Medium", ...
+
+
+class Skill(BaseModel):
+    name: str
+    level: int
+    passion: int = 0  # 0 none, 1 interested, 2 burning
+    totally_disabled: bool = False
+
+
+class WorkPriority(BaseModel):
+    work_type: str
+    priority: int  # 0 = off, 1 = highest ... 4 = lowest
+    is_totally_disabled: bool = False
+
+
+class Colonist(BaseModel):
+    id: int
+    name: str
+    age: int
+    health: float  # 0-1
+    mood: float    # 0-1
+    hunger: float  # 0-1, where 1 = fully fed
+    current_job: str = ""
+    skills: list[Skill] = []
+    # Only work types that are switched on. A missing work type means
+    # priority 0 (off), or work this colonist is incapable of.
+    work_priorities: list[WorkPriority] = []
+
+
+class Weather(BaseModel):
+    weather: str
+    temperature_c: float  # RIMAPI reports Celsius
+
+
+class Threat(BaseModel):
+    """A group on the map belonging to a hostile faction (raid, mech cluster, ...)."""
+
+    faction_name: str
+    faction_type: str
+    behaviour: str         # RimWorld's lord job, e.g. LordJob_AssaultColony
+    current_step: str      # e.g. LordToil_Sleep for a dormant mech cluster
+    pawn_count: int
+    active: bool           # False while e.g. a mech cluster is still asleep
+
+
 class NewGameOptions(BaseModel):
     """Settings for POST /api/v1/game/start. Defaults match RimWorld's own.
 
@@ -110,6 +161,78 @@ class RimApiClient:
         if speed == PAUSED:
             raise ValueError("resume() needs a running speed (1-3), not 0")
         self.set_speed(speed)
+
+    # --- Reading the colony -------------------------------------------------
+
+    def get_alerts(self) -> list[Alert]:
+        """The alerts shown on the right side of the screen."""
+        return [Alert.model_validate(a) for a in self._request("GET", "/api/v1/ui/alerts")]
+
+    def get_colonists(self) -> list[Colonist]:
+        """Every colonist with their needs, current job, skills and work priorities."""
+        colonists = []
+        for c in self._request("GET", "/api/v1/colonists/detailed"):
+            work = c.get("colonist_work_info") or {}
+            colonists.append(Colonist.model_validate({
+                **c["colonist"],
+                "current_job": work.get("current_job") or "",
+                "skills": work.get("skills") or [],
+                "work_priorities": work.get("work_priorities") or [],
+            }))
+        return colonists
+
+    def get_work_types(self) -> list[str]:
+        """Names accepted by set_work_priority, e.g. "Cooking", "Construction"."""
+        return self._request("GET", "/api/v1/work-list")["work"]
+
+    def get_weather(self, map_id: int = 0) -> Weather:
+        data = self._request("GET", "/api/v1/map/weather", params={"map_id": map_id})
+        return Weather(weather=data["weather"], temperature_c=data["temperature"])
+
+    def get_datetime(self) -> str:
+        """In-game date and time, e.g. "1st of Aprimay, 5500, 6h"."""
+        return self._request("GET", "/api/v1/datetime")["datetime"]
+
+    def get_threats(self, map_id: int = 0) -> list[Threat]:
+        """Groups on the map whose faction is hostile to the colony."""
+        # A faction's name alone is not unique (there are two "Ancients"), so
+        # match on name and faction type together.
+        hostile = {
+            (f["name"], f["def_name"])
+            for f in self._request("GET", "/api/v1/factions")
+            if f.get("relation") == "Hostile"
+        }
+        threats = []
+        for lord in self._request("GET", "/api/v1/lords", params={"map_id": map_id}):
+            if (lord["faction_name"], lord["faction_def_name"]) not in hostile:
+                continue
+            threats.append(Threat(
+                faction_name=lord["faction_name"],
+                faction_type=lord["faction_def_name"],
+                behaviour=lord["lord_job_type"],
+                current_step=lord["current_toil_name"],
+                pawn_count=len(lord.get("owned_pawn_ids") or []),
+                active=lord.get("any_active_pawn", True),
+            ))
+        return threats
+
+    # --- Acting on the colony ------------------------------------------------
+
+    def set_work_priority(self, colonist_id: int, work_type: str, priority: int) -> None:
+        """Set how much a colonist prioritises a type of work.
+
+        priority: 0 = don't do it, 1 = highest ... 4 = lowest.
+        Tick "Manual priorities" in the game's Work tab first: without it,
+        RimWorld stores every non-zero value as 3, i.e. just "enabled".
+        RIMAPI refuses work the colonist is incapable of (raises RimApiError).
+        """
+        if not 0 <= priority <= 4:
+            raise ValueError("priority must be 0 (off) or 1-4")
+        self._request(
+            "POST",
+            "/api/v1/colonist/work-priority",
+            json={"id": colonist_id, "work": work_type, "priority": priority},
+        )
 
     def start_game(
         self,
