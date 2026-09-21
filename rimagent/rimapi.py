@@ -208,7 +208,7 @@ class RimApiClient:
         return colonists
 
     def get_work_types(self) -> list[str]:
-        """Names accepted by set_work_priority, e.g. "Cooking", "Construction"."""
+        """Names accepted by enable_work/disable_work, e.g. "Cooking", "Construction"."""
         return self._request("GET", "/api/v1/work-list")["work"]
 
     def get_weather(self, map_id: int = 0) -> Weather:
@@ -244,24 +244,19 @@ class RimApiClient:
 
     # --- Acting on the colony ------------------------------------------------
 
+    # Work is simply on or off: without "Manual priorities" ticked in the game's
+    # Work tab, RimWorld treats every enabled job the same. RIMAPI refuses work
+    # a colonist is incapable of (raises RimApiError).
+
     def enable_work(self, colonist_id: int, work_type: str) -> None:
         """Let a colonist do this kind of work."""
-        self.set_work_priority(colonist_id, work_type, 3)
+        self._set_work(colonist_id, work_type, 3)
 
     def disable_work(self, colonist_id: int, work_type: str) -> None:
         """Stop a colonist doing this kind of work."""
-        self.set_work_priority(colonist_id, work_type, 0)
+        self._set_work(colonist_id, work_type, 0)
 
-    def set_work_priority(self, colonist_id: int, work_type: str, priority: int) -> None:
-        """Set how much a colonist prioritises a type of work.
-
-        priority: 0 = don't do it, 1 = highest ... 4 = lowest.
-        Tick "Manual priorities" in the game's Work tab first: without it,
-        RimWorld stores every non-zero value as 3, i.e. just "enabled".
-        RIMAPI refuses work the colonist is incapable of (raises RimApiError).
-        """
-        if not 0 <= priority <= 4:
-            raise ValueError("priority must be 0 (off) or 1-4")
+    def _set_work(self, colonist_id: int, work_type: str, priority: int) -> None:
         self._request(
             "POST",
             "/api/v1/colonist/work-priority",

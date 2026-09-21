@@ -7,7 +7,7 @@ The agent loop itself lives elsewhere; this repo provides:
 | File | What it does |
 |------|--------------|
 | `rimagent/config.py` | Reads `OLLAMA_HOST` and `RIMAPI_URL` from the environment / `.env` |
-| `rimagent/rimapi.py` | RIMAPI client: `get_state()`, `pause()`, `resume()`, `start_game()`, `get_colonists()`, `get_alerts()`, `get_threats()`, `get_weather()`, `get_datetime()`, `get_work_types()`, `set_work_priority()` |
+| `rimagent/rimapi.py` | RIMAPI client: `get_state()`, `pause()`, `resume()`, `start_game()`, `get_colonists()`, `get_alerts()`, `get_threats()`, `get_weather()`, `get_datetime()`, `get_work_types()`, `enable_work()`, `disable_work()` |
 | `rimagent/fake_model.py` | Fake model returning canned answers, for offline testing |
 | `rimagent/runlog.py` | Writes state snapshots and decisions as JSON lines in `logs/` |
 | `scripts/smoke_test.py` | Reads state, pauses, resumes a live game |
@@ -40,11 +40,12 @@ python -m scripts.smoke_test
 It prints the colony's tick, colonist count and storyteller, then pauses and
 resumes the game, checking each step took effect.
 
-## Work priorities
+## Work
 
-`set_work_priority()` only has an effect beyond on/off if **Manual priorities**
-is ticked at the top of the game's Work tab (once per colony). Without it,
-RimWorld treats every enabled job as priority 3.
+The agent switches work on or off per colonist with `enable_work()` and
+`disable_work()`. It does not rank jobs: RIMAPI cannot turn on the game's
+**Manual priorities** setting, and without it RimWorld treats every enabled
+job the same.
 
 ## Starting a new colony from code
 
