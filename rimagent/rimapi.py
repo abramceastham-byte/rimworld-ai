@@ -17,12 +17,14 @@ from rimagent.construction import (
     BUILDINGS,
     CROPS,
     DESIGNATIONS,
+    MAX_CHOP_TREES,
     MAX_DESIGNATE_CELLS,
     MAX_ZONE_CELLS,
     Rect,
     TerrainInfo,
     TerrainMap,
     footprint,
+    is_tree,
 )
 
 # Values accepted by POST /api/v1/game/speed
@@ -128,6 +130,17 @@ class WorkTable(BaseModel):
     bills_count: int = 0
     recipes: list[Recipe] = Field(default_factory=list)
     bills: list[Bill] = Field(default_factory=list)
+
+
+class MapThing(BaseModel):
+    """An item or plant on the map, from /map/things or /map/plants."""
+
+    thing_id: int
+    def_name: str
+    label: str = ""
+    position: MapPosition
+    stack_count: int = 1
+    is_forbidden: bool = False
 
 
 class Zone(BaseModel):
@@ -602,6 +615,8 @@ class RimApiClient:
             raise ValueError(f"{def_name} needs a material, one of: {', '.join(materials)}")
         if not materials and stuff:
             raise ValueError(f"{def_name} has a fixed cost and takes no material")
+        if stuff and stuff not in defs.thing_names:
+            raise ValueError(f"material {stuff!r} does not exist in this game")
 
         area = footprint(x, z, spec.size, rotation)
         _check_rect(area, self.get_terrain(map_id), spec.size[0] * spec.size[1])
@@ -656,6 +671,66 @@ class RimApiClient:
             "/api/v1/order/designate/area",
             json={"map_id": map_id, "type": kind, **_corners(rect)},
         )
+
+    def get_items(self, map_id: int = 0) -> list[MapThing]:
+        """Every haulable item on the map, with its position and forbidden flag."""
+        return [MapThing.model_validate(t) for t in self._request(
+            "GET", "/api/v1/map/things", params={"map_id": map_id}
+        )]
+
+    def get_trees(self, map_id: int = 0) -> list[MapThing]:
+        """Every tree on the map. /map/plants lists all ~25,000 plants (about 7 MB),
+        so call this sparingly."""
+        return [
+            MapThing.model_validate(p)
+            for p in self._request("GET", "/api/v1/map/plants", params={"map_id": map_id})
+            if is_tree(p.get("def_name", ""))
+        ]
+
+    def allow_items(self, rect: Rect, map_id: int = 0) -> int:
+        """Unforbid every forbidden item in a rectangle so colonists can use it.
+
+        Returns how many items were allowed. Limited to a rectangle because
+        forbidden items are scattered across the whole map, some of them near
+        dangers the colonists shouldn't walk into.
+        """
+        _check_rect(rect, self.get_terrain(map_id), MAX_DESIGNATE_CELLS)
+        ids = [
+            t.thing_id for t in self.get_items(map_id)
+            if t.is_forbidden and rect.contains(t.position.x, t.position.z)
+        ]
+        if not ids:
+            raise ValueError(f"there are no forbidden items in {rect}")
+        self._request(
+            "POST",
+            "/api/v1/things/set-forbidden",
+            json={"map_id": map_id, "thing_ids": ids, "forbidden": False},
+        )
+        return len(ids)
+
+    def chop_trees(self, rect: Rect, map_id: int = 0) -> int:
+        """Mark the trees in a rectangle for cutting, for wood.
+
+        RIMAPI has no chop order, and its "harvest" designation marks every ripe
+        plant in an area, crops included. So this marks each tree's own cell.
+        At most MAX_CHOP_TREES, nearest the middle of the rectangle first.
+        Trees too young to give wood are skipped by the game.
+        Returns how many trees were marked.
+        """
+        _check_rect(rect, self.get_terrain(map_id), MAX_DESIGNATE_CELLS)
+        trees = [t for t in self.get_trees(map_id) if rect.contains(t.position.x, t.position.z)]
+        if not trees:
+            raise ValueError(f"there are no trees in {rect}")
+        cx, cz = (rect.x1 + rect.x2) / 2, (rect.z1 + rect.z2) / 2
+        trees.sort(key=lambda t: (t.position.x - cx) ** 2 + (t.position.z - cz) ** 2)
+        for tree in trees[:MAX_CHOP_TREES]:
+            cell = Rect(tree.position.x, tree.position.z, tree.position.x, tree.position.z)
+            self._request(
+                "POST",
+                "/api/v1/order/designate/area",
+                json={"map_id": map_id, "type": "harvest", **_corners(cell)},
+            )
+        return min(len(trees), MAX_CHOP_TREES)
 
     def start_game(
         self,

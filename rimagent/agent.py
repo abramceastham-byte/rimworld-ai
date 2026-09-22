@@ -1,5 +1,6 @@
 """The agent loop: observe the game, ask a model what to do, act, and log it."""
 
+import re
 import time
 from collections.abc import Callable
 from typing import Literal
@@ -9,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from rimagent.construction import (
     CROPS,
+    MAX_CHOP_TREES,
     MAX_DESIGNATE_CELLS,
     MAX_ZONE_CELLS,
     STUFF_BY_CATEGORY,
@@ -24,6 +26,7 @@ from rimagent.rimapi import (
     Colonist,
     GameDefs,
     GameState,
+    MapThing,
     RimApiClient,
     RimApiError,
     Threat,
@@ -49,6 +52,8 @@ class Decision(BaseModel):
         "create_stockpile",
         "place_blueprint",
         "designate",
+        "allow_items",
+        "chop_trees",
     ]
     reason: str = ""
     colonist: str | None = None  # a colonist's name, for enable_work / disable_work
@@ -93,6 +98,8 @@ REQUIRED_FIELDS = {
     "create_stockpile": RECT,
     "place_blueprint": ("building_def", "x", "z"),
     "designate": ("designation", *RECT),
+    "allow_items": RECT,
+    "chop_trees": RECT,
 }
 
 
@@ -114,6 +121,11 @@ INSTRUCTIONS = (
     "place_blueprint places one building from the buildable list at x,z, with rotation "
     "0 north, 1 east, 2 south or 3 west, and a stuff material if the building lists "
     "any. Colonists then build it if they have Construction enabled and materials.\n"
+    f"allow_items unforbids every forbidden item in a rectangle (at most "
+    f"{MAX_DESIGNATE_CELLS} cells) so colonists can haul and use it; forbidden items "
+    "are marked f on the map. chop_trees marks the trees (T on the map) in a rectangle "
+    f"for cutting, up to {MAX_CHOP_TREES} per action; colonists with PlantCutting "
+    "enabled cut them for wood.\n"
     "Keep new zones and buildings near the colonists and away from each other. If an "
     "area is blocked, the action fails with the reason, so pick another spot.\n"
     "You may include an optional memory_update object. Use observation only for "
@@ -135,6 +147,10 @@ INSTRUCTIONS = (
     '"rotation": 0, "stuff": "WoodLog", "reason": "Everyone needs a bed."}\n'
     '{"action": "designate", "designation": "harvest", "x1": 120, "z1": 90, '
     '"x2": 135, "z2": 105, "reason": "Collect ripe wild berries."}\n'
+    '{"action": "allow_items", "x1": 128, "z1": 100, "x2": 142, "z2": 112, '
+    '"reason": "Let colonists use the crash supplies."}\n'
+    '{"action": "chop_trees", "x1": 130, "z1": 88, "x2": 145, "z2": 96, '
+    '"reason": "Wood for beds and walls."}\n'
     '{"action": "wait", "reason": "planning", "memory_update": '
     '{"replace_plan": {"objective": "Stabilize food production", "status": "active", '
     '"steps": [{"description": "Assign a capable cook", "status": "pending"}]}, '
@@ -203,6 +219,7 @@ def describe_work_table(table: WorkTable) -> list[str]:
 
 
 MINIMAP_RADIUS = 12
+TREE_REFRESH_STEPS = 10
 
 
 def colony_center(colonists: list[Colonist]) -> tuple[int, int] | None:
@@ -219,8 +236,11 @@ def describe_map(
     zones: list[Zone],
     placements: list[str],
     finished_research: set[str],
+    items: list[MapThing] | None = None,
+    trees: list[MapThing] | None = None,
 ) -> list[str]:
     """Everything the model needs to pick coordinates without inventing them."""
+    forbidden = [i for i in items or [] if i.is_forbidden]
     lines = [f"Map: {terrain.width} x {terrain.height} cells. x grows east, z grows north."]
     for c in colonists:
         if c.position:
@@ -232,20 +252,49 @@ def describe_map(
         r = MINIMAP_RADIUS
         x1, x2 = max(0, cx - r), min(terrain.width - 1, cx + r)
         z1, z2 = max(0, cz - r), min(terrain.height - 1, cz + r)
-        at_colonist = {(c.position.x, c.position.z) for c in colonists if c.position}
+        # Most important mark wins when several share a cell.
+        marks: dict[tuple[int, int], str] = {}
+        for t in trees or []:
+            marks[(t.position.x, t.position.z)] = "T"
+        for i in forbidden:
+            marks[(i.position.x, i.position.z)] = "f"
+        for c in colonists:
+            if c.position:
+                marks[(c.position.x, c.position.z)] = "@"
         lines += [
             "",
-            f"Terrain around the colony, x {x1}-{x2} left to right, z {z2} (top) down to {z1}:",
+            f"Map around the colony, x {x1}-{x2} left to right, z {z2} (top) down to {z1}:",
             "  R rich soil  . soil (any crop)  , poor soil  _ stone/floor, nothing grows",
-            "  ~ water/marsh (no heavy building)  @ colonist",
-            "  Rock, trees and items are not shown; blocked spots are rejected with a reason.",
+            "  ~ water/marsh (no heavy building)  @ colonist  T tree  f forbidden item",
+            "  Rock and allowed items are not shown; blocked spots are rejected with a reason.",
         ]
         for z in range(z2, z1 - 1, -1):
             row = "".join(
-                "@" if (x, z) in at_colonist else map_symbol(defs.terrain.get(terrain.at(x, z)))
+                marks.get((x, z)) or map_symbol(defs.terrain.get(terrain.at(x, z)))
                 for x in range(x1, x2 + 1)
             )
             lines.append(f"  z={z:3d} {row}")
+
+        view = Rect(x1, z1, x2, z2)
+        nearby = [i for i in forbidden if view.contains(i.position.x, i.position.z)]
+        if nearby:
+            totals: dict[str, int] = {}
+            for i in nearby:
+                # RimWorld labels already carry the count ("steel x36"); drop it.
+                name = re.sub(r" x\d+$", "", i.label or i.def_name)
+                totals[name] = totals.get(name, 0) + i.stack_count
+            box = Rect.from_corners(
+                min(i.position.x for i in nearby), min(i.position.z for i in nearby),
+                max(i.position.x for i in nearby), max(i.position.z for i in nearby),
+            )
+            listed = ", ".join(f"{label} x{n}" for label, n in sorted(totals.items())[:15])
+            more = f" and {len(totals) - 15} more kinds" if len(totals) > 15 else ""
+            lines.append(
+                f"Forbidden items on this map section ({len(nearby)} stacks, all within {box}): "
+                f"{listed}{more}."
+            )
+        near_trees = sum(1 for t in trees or [] if view.contains(t.position.x, t.position.z))
+        lines.append(f"Trees on this map section: {near_trees}.")
 
     lines += ["", "Zones: " + (", ".join(f"{z.label} ({z.type}, {z.cells_count} cells)" for z in zones) or "none") + "."]
     lines.append("Placed by you: " + ("; ".join(placements) or "nothing yet") + ".")
@@ -276,6 +325,10 @@ def describe_placement(decision: Decision, result: object) -> str:
         return f"stockpile {decision.rect()} (zone {result})"
     if decision.action == "place_blueprint":
         return f"{decision.building_def} blueprint covering {result}"
+    if decision.action == "allow_items":
+        return f"allowed {result} item stacks in {decision.rect()}"
+    if decision.action == "chop_trees":
+        return f"marked {result} trees for cutting in {decision.rect()}"
     return f"{decision.designation} designation {decision.rect()}"
 
 
@@ -432,9 +485,21 @@ def run(
             d.building_def, d.x, d.z, d.rotation, d.stuff
         ),
         "designate": lambda d, cols: client.designate(d.designation, d.rect()),
+        "allow_items": lambda d, cols: client.allow_items(d.rect()),
+        "chop_trees": lambda d, cols: client.chop_trees(d.rect()),
     }
-    map_actions = ("create_growing_zone", "create_stockpile", "place_blueprint", "designate")
+    map_actions = (
+        "create_growing_zone",
+        "create_stockpile",
+        "place_blueprint",
+        "designate",
+        "allow_items",
+        "chop_trees",
+    )
     placements: list[str] = []  # RIMAPI doesn't say where zones are, so remember
+    # /map/plants is ~7 MB, so trees are re-read every few steps, not every step.
+    trees: list[MapThing] = []
+    trees_read_at: int | None = None
     work_types = client.get_work_types()
     if memory is None:
         memory = AgentMemory()
@@ -449,6 +514,9 @@ def run(
                 alerts = client.get_alerts()
                 threats = client.get_threats()
                 work_tables = client.get_work_tables()
+                if trees_read_at is None or step - trees_read_at >= TREE_REFRESH_STEPS:
+                    trees = client.get_trees()
+                    trees_read_at = step
                 map_lines = describe_map(
                     colonists,
                     client.get_terrain(),
@@ -456,6 +524,8 @@ def run(
                     client.get_zones(),
                     placements,
                     client.get_finished_research(),
+                    client.get_items(),
+                    trees,
                 )
             except (RimApiError, httpx.TimeoutException) as e:
                 print(f"Step {step}: could not read game state: {e}")
@@ -517,6 +587,8 @@ def run(
             if error is None and decision.action in map_actions:
                 placements.append(describe_placement(decision, result))
                 del placements[:-15]  # keep the prompt bounded
+            if decision.action == "chop_trees":
+                trees_read_at = None  # re-read next step so cut trees update
 
             if error is None:
                 if decision.action == "pause":

@@ -45,10 +45,18 @@ DEFS = {
 class FakeRimApi:
     """Answers the endpoints the map methods use, and records every call."""
 
-    def __init__(self, issues: dict | None = None, research: list[str] | None = None):
+    def __init__(
+        self,
+        issues: dict | None = None,
+        research: list[str] | None = None,
+        items: list[dict] | None = None,
+        plants: list[dict] | None = None,
+    ):
         self.calls: list[tuple[str, str, dict]] = []
         self.issues = issues or {}
         self.research = research if research is not None else ["ComplexFurniture"]
+        self.items = items or []
+        self.plants = plants or []
 
     def __call__(self, method: str, path: str, **kwargs):
         self.calls.append((method, path, kwargs))
@@ -64,6 +72,10 @@ class FakeRimApi:
             return {"zone": {"id": 7}}
         if path == "/api/v1/map/zone/stockpile":
             return {"zone_id": 8}
+        if path == "/api/v1/map/things":
+            return self.items
+        if path == "/api/v1/map/plants":
+            return self.plants
         return None
 
     def writes(self) -> list[tuple[str, str, dict]]:
@@ -193,6 +205,12 @@ class BlueprintTests(MapTestCase):
         with self.assertRaisesRegex(ValueError, "takes no material"):
             client.place_blueprint("Campfire", 4, 4, stuff="WoodLog")
 
+    def test_refuses_materials_missing_from_the_game(self) -> None:
+        fake = FakeRimApi()  # the fake game has WoodLog and Steel, but no stone blocks
+        with self.assertRaisesRegex(ValueError, "does not exist in this game"):
+            self.client_with(fake).place_blueprint("Wall", 4, 4, stuff="BlocksGranite")
+        self.assertEqual(fake.writes(), [])
+
     def test_refuses_buildings_outside_the_catalog(self) -> None:
         fake = FakeRimApi()
         with self.assertRaisesRegex(ValueError, "not in the building catalog"):
@@ -225,6 +243,64 @@ class DesignationTests(MapTestCase):
         fake = FakeRimApi()
         with self.assertRaisesRegex(ValueError, "designation must be one of"):
             self.client_with(fake).designate("deconstruct", Rect(0, 0, 4, 4))
+        self.assertEqual(fake.writes(), [])
+
+
+def thing(thing_id: int, def_name: str, x: int, z: int, forbidden: bool = False) -> dict:
+    return {"thing_id": thing_id, "def_name": def_name, "label": def_name.lower(),
+            "position": {"x": x, "y": 0, "z": z}, "stack_count": 1, "is_forbidden": forbidden}
+
+
+class AllowItemsTests(MapTestCase):
+    def test_allows_only_forbidden_items_inside_the_rectangle(self) -> None:
+        fake = FakeRimApi(items=[
+            thing(1, "Steel", 2, 2, forbidden=True),
+            thing(2, "MealSurvivalPack", 3, 3, forbidden=True),
+            thing(3, "Silver", 3, 3, forbidden=False),      # already allowed
+            thing(4, "Steel", 8, 8, forbidden=True),        # outside
+        ])
+        self.assertEqual(self.client_with(fake).allow_items(Rect(1, 1, 4, 4)), 2)
+        self.assertEqual(fake.writes(), [(
+            "POST", "/api/v1/things/set-forbidden",
+            {"json": {"map_id": 0, "thing_ids": [1, 2], "forbidden": False}},
+        )])
+
+    def test_says_so_when_nothing_is_forbidden_there(self) -> None:
+        fake = FakeRimApi(items=[thing(4, "Steel", 8, 8, forbidden=True)])
+        with self.assertRaisesRegex(ValueError, "no forbidden items"):
+            self.client_with(fake).allow_items(Rect(1, 1, 4, 4))
+        self.assertEqual(fake.writes(), [])
+
+
+class ChopTreesTests(MapTestCase):
+    def test_marks_each_tree_cell_and_nothing_else(self) -> None:
+        fake = FakeRimApi(plants=[
+            thing(10, "Plant_TreeOak", 2, 2),
+            thing(11, "Plant_Potato", 3, 3),      # a crop: must not be harvested
+            thing(12, "Plant_TreePoplar", 4, 4),
+            thing(13, "Plant_TreeOak", 8, 8),     # outside
+        ])
+        self.assertEqual(self.client_with(fake).chop_trees(Rect(1, 1, 5, 5)), 2)
+        cells = [c[2]["json"]["point_a"] for c in fake.writes()]
+        self.assertCountEqual(cells, [{"x": 2, "y": 0, "z": 2}, {"x": 4, "y": 0, "z": 4}])
+        for _, path, kwargs in fake.writes():
+            self.assertEqual(path, "/api/v1/order/designate/area")
+            self.assertEqual(kwargs["json"]["type"], "harvest")
+            self.assertEqual(kwargs["json"]["point_a"], kwargs["json"]["point_b"])
+
+    def test_caps_trees_per_action_nearest_first(self) -> None:
+        plants = [thing(100 + i, "Plant_TreeOak", x, z) for i, (x, z) in
+                  enumerate((x, z) for x in range(9) for z in range(9))]  # 81 trees
+        fake = FakeRimApi(plants=plants)
+        self.assertEqual(self.client_with(fake).chop_trees(Rect(0, 0, 8, 8)), 30)
+        self.assertEqual(len(fake.writes()), 30)
+        first = fake.writes()[0][2]["json"]["point_a"]
+        self.assertEqual((first["x"], first["z"]), (4, 4))  # the middle
+
+    def test_says_so_when_there_are_no_trees(self) -> None:
+        fake = FakeRimApi(plants=[thing(11, "Plant_Potato", 3, 3)])
+        with self.assertRaisesRegex(ValueError, "no trees"):
+            self.client_with(fake).chop_trees(Rect(1, 1, 5, 5))
         self.assertEqual(fake.writes(), [])
 
 

@@ -13,6 +13,12 @@ from dataclasses import dataclass
 # Largest rectangle the agent may turn into one zone, and may designate at once.
 MAX_ZONE_CELLS = 15 * 15
 MAX_DESIGNATE_CELLS = 20 * 20
+MAX_CHOP_TREES = 30  # trees marked by one chop_trees action
+
+
+def is_tree(def_name: str) -> bool:
+    """Trees are the plants that give wood when cut, e.g. Plant_TreeOak."""
+    return def_name.startswith("Plant_Tree")
 
 # Designation types RIMAPI offers that are safe to hand to a model. RIMAPI also
 # has "deconstruct" (tears down any building, including the colony's own) and
@@ -101,6 +107,9 @@ class Rect:
     @property
     def cells(self) -> int:
         return (self.x2 - self.x1 + 1) * (self.z2 - self.z1 + 1)
+
+    def contains(self, x: int, z: int) -> bool:
+        return self.x1 <= x <= self.x2 and self.z1 <= z <= self.z2
 
     def within(self, width: int, height: int) -> bool:
         return 0 <= self.x1 and 0 <= self.z1 and self.x2 < width and self.z2 < height
