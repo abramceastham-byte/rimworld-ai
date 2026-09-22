@@ -1,13 +1,19 @@
 """Save state snapshots and decisions as JSON lines under logs/.
 
-Each run gets its own file, logs/run-YYYYMMDD-HHMMSS.jsonl. Every line is one
-JSON object with a "kind" (such as "state", "event", "decision", or
-"model_failure"), a UTC timestamp, and the payload. One object per line means
-you can read a log with a few lines of Python, or with tools like jq, even if a
-run crashed halfway through.
+Each run gets its own folder, named by local start time and a label such as
+the model and think setting:
+
+    logs/runs/2026-09-22_0630_gpt-oss-20b_think-medium/run.jsonl
+
+Every line of run.jsonl is one JSON object with a "kind" (such as "run",
+"state", "event", "decision", or "model_failure"), a UTC timestamp, and the
+payload. One object per line means you can read a log with a few lines of
+Python, or with tools like jq, even if a run crashed halfway through.
+Dry runs go to logs/dry-runs/ with the same kind of name.
 """
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,12 +21,26 @@ from typing import Any
 from pydantic import BaseModel
 
 
+def stamped_name(label: str | None = None, when: datetime | None = None) -> str:
+    """"2026-09-22_0630_<label>": sorts by time, readable at a glance."""
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d_%H%M%S")
+    if not label:
+        return stamp
+    # Keep names safe for any filesystem: "gpt-oss:20b" -> "gpt-oss-20b".
+    return f"{stamp}_{re.sub(r'[^A-Za-z0-9._-]+', '-', label).strip('-')}"
+
+
 class RunLogger:
-    def __init__(self, log_dir: str | Path = "logs"):
-        log_dir = Path(log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        started = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        self.path = log_dir / f"run-{started}.jsonl"
+    def __init__(self, log_dir: str | Path = "logs", label: str | None = None):
+        runs = Path(log_dir) / "runs"
+        folder = runs / stamped_name(label)
+        n = 2
+        while folder.exists():  # two runs started in the same second
+            folder = runs / f"{stamped_name(label)}_{n}"
+            n += 1
+        folder.mkdir(parents=True)
+        self.folder = folder
+        self.path = folder / "run.jsonl"
 
     def _write(self, kind: str, payload: Any) -> None:
         if isinstance(payload, BaseModel):

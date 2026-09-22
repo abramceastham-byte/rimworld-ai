@@ -139,7 +139,7 @@ with RimApiClient() as client:
 With Ollama reachable at `OLLAMA_HOST` (see the SSH tunnel section below):
 
 ```bash
-# One decision about the live colony, printed and saved to logs/dry-run-*.json,
+# One decision about the live colony, printed and saved to logs/dry-runs/,
 # never acted on. Use it after changing the prompt or to compare models.
 python -m scripts.dry_run qwen3:14b --think on
 
@@ -149,7 +149,20 @@ python -m scripts.run_agent --model gpt-oss:20b --think low --steps 20
 ```
 
 `--think` is `on`/`off` for qwen3 and `low`/`medium`/`high` for gpt-oss (which
-can't switch it off). Each run log starts with a `run` record naming the model
+can't switch it off).
+
+Logs are organised by run:
+
+```
+logs/runs/2026-09-22_063000_gpt-oss-20b_think-medium/run.jsonl   # one folder per run
+logs/dry-runs/2026-09-22_021915_gpt-oss-20b_think-low.json       # one file per dry run
+```
+
+`python -m scripts.show_log` turns the newest log into Markdown next to it
+(`run.md`, or the dry run's name with `.md`); `--all` converts every log.
+Open it in VS Code and press Ctrl+Shift+V.
+
+Each run log starts with a `run` record naming the model
 and settings, and every `decision` record includes the model's `thinking` and
 timings. The thinking is only logged; it is never fed back into the next prompt.
 Leave out `--model` to use the fake model. `--num-ctx` (default 16384) sets the

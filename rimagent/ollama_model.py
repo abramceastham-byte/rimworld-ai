@@ -33,6 +33,15 @@ def parse_think(value: str | None) -> Think:
     raise ValueError(f"think must be on, off, low, medium or high, not {value!r}")
 
 
+def think_label(think: Think) -> str:
+    """The think setting as typed on the command line, for log names."""
+    if think is None:
+        return "default"
+    if isinstance(think, bool):
+        return "on" if think else "off"
+    return think
+
+
 class OllamaModel:
     def __init__(
         self,
@@ -76,6 +85,10 @@ class OllamaModel:
             "output_tokens": response.eval_count,
         }
         return response.message.content
+
+    def label(self) -> str:
+        """Short name for log files, e.g. "qwen3:14b_think-on"."""
+        return f"{self.name}_think-{think_label(self.think)}"
 
     def describe(self) -> dict[str, Any]:
         """Settings to record at the start of a run log."""

@@ -36,14 +36,14 @@ def main() -> None:
             think=parse_think(args.think),
             num_ctx=args.num_ctx,
         )
-        info = model.describe()
+        info, label = model.describe(), model.label()
         steps = args.steps or 10
     else:
         model = make_fake_model()
-        info = {"model": "fake"}
+        info, label = {"model": "fake"}, "fake"
         steps = args.steps or 3
 
-    logger = RunLogger()
+    logger = RunLogger(label=label)
     logger.log_run_info({**info, "steps": steps, "step_seconds": args.step_seconds})
     print(f"Running {info['model']} for {steps} steps. Log: {logger.path}")
     with RimApiClient() as client, EventListener() as events:

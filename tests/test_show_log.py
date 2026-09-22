@@ -38,8 +38,12 @@ class ShowLogTests(unittest.TestCase):
                              "building_def": "Bed", "position": [125, 107], "rotation": 1,
                              "stuff": "WoodLog", "error": "blocked by wall at (125,108)"})
 
-        md = convert(logger.path).read_text(encoding="utf-8")
+        md_path = convert(logger.path)
+        md = md_path.read_text(encoding="utf-8")
 
+        self.assertEqual(logger.path.parent.parent, self.dir / "runs")
+        self.assertEqual(md_path, logger.folder / "run.md")
+        self.assertIn(f"# Run {logger.folder.name}", md)
         self.assertIn("model `gpt-oss:20b`", md)
         self.assertIn("**Decisions:** 2 (allow_items x1, place_blueprint x1)", md)
         self.assertIn("**Failed actions:** 1", md)
@@ -53,6 +57,12 @@ class ShowLogTests(unittest.TestCase):
         self.assertIn("## Step 1: place_blueprint (FAILED)", md)
         self.assertIn("Position: `(125,107)`, facing east", md)
         self.assertIn("FAILED: blocked by wall at (125,108)", md)
+
+    def test_run_folders_are_named_by_time_and_label(self) -> None:
+        first = RunLogger(self.dir, label="gpt-oss:20b_think-medium")
+        second = RunLogger(self.dir, label="gpt-oss:20b_think-medium")
+        self.assertRegex(first.folder.name, r"^\d{4}-\d{2}-\d{2}_\d{6}_gpt-oss-20b_think-medium$")
+        self.assertNotEqual(first.folder, second.folder)  # same second: no clash
 
     def test_dry_run(self) -> None:
         path = self.dir / "dry-run-qwen3_14b-x.json"

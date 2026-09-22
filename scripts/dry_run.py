@@ -3,7 +3,8 @@
 Useful after changing the prompt, or to compare models. It builds the same
 prompt a real step would (reading memory/ but never writing to it), sends it to
 the model, prints the reasoning, reply and whether it parses, and saves all of
-it to logs/dry-run-<model>-<time>.json. Nothing is sent to the game.
+it to logs/dry-runs/<date>_<time>_<model>_think-<setting>.json. Nothing is
+sent to the game.
 
     python -m scripts.dry_run qwen3:14b --think off
     python -m scripts.dry_run gpt-oss:20b --think low
@@ -11,7 +12,6 @@ it to logs/dry-run-<model>-<time>.json. Nothing is sent to the game.
 
 import argparse
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -20,6 +20,7 @@ from rimagent.agent import Decision, build_prompt, describe_map, describe_pause
 from rimagent.memory import AgentMemory
 from rimagent.ollama_model import OllamaModel, parse_think
 from rimagent.rimapi import RimApiClient
+from rimagent.runlog import stamped_name
 
 
 def live_prompt(client: RimApiClient) -> str:
@@ -71,9 +72,8 @@ def main() -> None:
     print("\n--- " + ("valid decision ---\n" + json.dumps(decision, indent=2) if decision
                      else f"INVALID ---\n{problem}"))
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    out = Path("logs") / f"dry-run-{args.model.replace(':', '_')}-{stamp}.json"
-    out.parent.mkdir(exist_ok=True)
+    out = Path("logs") / "dry-runs" / f"{stamped_name(model.label())}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
         "settings": model.describe(), "stats": stats, "prompt": prompt,
         "thinking": model.last_thinking, "reply": reply,

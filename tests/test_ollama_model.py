@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from rimagent.ollama_model import OllamaModel, parse_think
+from rimagent.ollama_model import OllamaModel, parse_think, think_label
 
 
 def fake_response(content: str, thinking: str | None = None):
@@ -26,6 +26,12 @@ class ParseThinkTests(unittest.TestCase):
         self.assertEqual(parse_think("low"), "low")
         with self.assertRaises(ValueError):
             parse_think("maybe")
+
+    def test_labels_match_the_command_line(self) -> None:
+        self.assertEqual([think_label(t) for t in (None, True, False, "medium")],
+                         ["default", "on", "off", "medium"])
+        model = OllamaModel("qwen3:14b", think=True, host="http://example.invalid")
+        self.assertEqual(model.label(), "qwen3:14b_think-on")
 
 
 class OllamaModelTests(unittest.TestCase):

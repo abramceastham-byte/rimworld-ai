@@ -1,15 +1,16 @@
 """Turn agent logs into readable Markdown.
 
 Works on both kinds of log in logs/:
-  run-*.jsonl      a real run: one section per step, with the decision, its
-                   reason, what happened, retries, and the model's reasoning
-  dry-run-*.json   a single dry-run decision, with the full prompt
+  runs/<name>/run.jsonl   a real run: one section per step, with the decision,
+                          its reason, what happened, retries, and the model's
+                          reasoning
+  dry-runs/<name>.json    a single dry-run decision, with the full prompt
 
-The Markdown is written next to the log (same name, .md). Open it in VS Code
-and press Ctrl+Shift+V for the preview.
+The Markdown is written next to the log (run.md, or <name>.md). Open it in VS
+Code and press Ctrl+Shift+V for the preview.
 
     python -m scripts.show_log                  # the newest log
-    python -m scripts.show_log logs/run-....jsonl
+    python -m scripts.show_log logs/runs/2026-09-22_0630_gpt-oss-20b_think-medium/run.jsonl
     python -m scripts.show_log --all            # every log in logs/
 """
 
@@ -95,7 +96,8 @@ def run_to_markdown(path: Path) -> str:
     decisions = [r["data"] for r in records if r["kind"] == "decision"]
     failures = [r["data"] for r in records if r["kind"] == "model_failure"]
 
-    out = [f"# {path.name}", ""]
+    # The folder name says which run this is (run.jsonl is the same everywhere).
+    out = [f"# Run {path.parent.name}", ""]
     if info:
         settings = ", ".join(f"{k} `{v}`" for k, v in info.items())
         out.append(f"**Settings:** {settings}")
@@ -168,7 +170,7 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
 def dry_run_to_markdown(path: Path) -> str:
     data = json.loads(path.read_text(encoding="utf-8"))
     settings, stats = data.get("settings", {}), data.get("stats", {})
-    out = [f"# {path.name}", "",
+    out = [f"# Dry run {path.stem}", "",
            "*Dry run: one decision about the live colony, not acted on.*", "",
            "**Settings:** " + ", ".join(f"{k} `{v}`" for k, v in settings.items()),
            f"**Model:** {stats.get('seconds')}s, {stats.get('prompt_tokens')} prompt tokens, "
@@ -200,7 +202,7 @@ def main() -> None:
     parser.add_argument("--all", action="store_true", help="Convert every log in logs/.")
     args = parser.parse_args()
 
-    logs = sorted([*LOG_DIR.glob("run-*.jsonl"), *LOG_DIR.glob("dry-run-*.json")],
+    logs = sorted([*LOG_DIR.glob("runs/*/run.jsonl"), *LOG_DIR.glob("dry-runs/*.json")],
                   key=lambda p: p.stat().st_mtime)
     paths = args.paths or (logs if args.all else logs[-1:])
     if not paths:
