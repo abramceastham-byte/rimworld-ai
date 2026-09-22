@@ -1,9 +1,10 @@
 """Save state snapshots and decisions as JSON lines under logs/.
 
 Each run gets its own file, logs/run-YYYYMMDD-HHMMSS.jsonl. Every line is one
-JSON object with a "kind" ("state" or "decision"), a UTC timestamp, and the
-payload. One object per line means you can read a log with a few lines of
-Python, or with tools like jq, even if a run crashed halfway through.
+JSON object with a "kind" (such as "state", "event", "decision", or
+"model_failure"), a UTC timestamp, and the payload. One object per line means
+you can read a log with a few lines of Python, or with tools like jq, even if a
+run crashed halfway through.
 """
 
 import json
@@ -44,6 +45,10 @@ class RunLogger:
     def log_decision(self, decision: Any) -> None:
         """Record what the model decided (raw text, a dict, or a pydantic model)."""
         self._write("decision", decision)
+
+    def log_model_failure(self, failure: Any) -> None:
+        """Record a failed model call or an invalid model response."""
+        self._write("model_failure", failure)
 
 
 def read_log(path: str | Path) -> list[dict]:

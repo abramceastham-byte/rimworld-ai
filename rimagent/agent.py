@@ -8,6 +8,7 @@ import httpx
 from pydantic import BaseModel, ValidationError, model_validator
 
 from rimagent.events import EventListener, GameEvent
+from rimagent.memory import AgentMemory, MemoryUpdate
 from rimagent.rimapi import (
     Alert,
     Colonist,
@@ -26,6 +27,7 @@ class Decision(BaseModel):
     reason: str = ""
     colonist: str | None = None  # a colonist's name, for enable_work / disable_work
     work_type: str | None = None  # e.g. "Cooking", for enable_work / disable_work
+    memory_update: MemoryUpdate | None = None
 
     @model_validator(mode="after")
     def work_actions_need_a_target(self) -> "Decision":
@@ -42,9 +44,19 @@ INSTRUCTIONS = (
     "You are managing a RimWorld colony.\n"
     "Choose exactly one action: pause, resume, wait, enable_work, disable_work.\n"
     "enable_work / disable_work switch one kind of work on or off for one colonist.\n"
+    "You may include an optional memory_update object. Use observation only for "
+    "durable insights worth remembering across the playthrough. Use replace_plan, "
+    "status_updates, and policy changes for intentions and strategy.\n"
+    "Do not store live facts already supplied every step: pause state, tick, wealth, "
+    "storyteller, colonist count, alerts, threats, colonist age/health/mood/hunger/job/"
+    "skills/work settings, new events, or available work types.\n"
     "Reply only with JSON, like one of these:\n"
     '{"action": "wait", "reason": "short explanation"}\n'
     '{"action": "enable_work", "colonist": "Skye", "work_type": "Cooking", "reason": "..."}\n'
+    '{"action": "wait", "reason": "planning", "memory_update": '
+    '{"replace_plan": {"objective": "Stabilize food production", "status": "active", '
+    '"steps": [{"description": "Assign a capable cook", "status": "pending"}]}, '
+    '"policies_to_add": ["Keep at least one capable colonist assigned to cooking"]}}\n'
 )
 
 
@@ -86,6 +98,7 @@ def build_prompt(
     events: list[GameEvent],
     work_types: list[str],
     pause_status: str,
+    memory: AgentMemory,
 ) -> str:
     """Build a prompt for the LLM based on the current game state."""
     lines = [
@@ -108,7 +121,7 @@ def build_prompt(
         "Work types: " + ", ".join(work_types) + ".",
         "",
     ]
-    return "\n".join(lines) + INSTRUCTIONS
+    return "\n".join(lines) + INSTRUCTIONS + "\n" + memory.to_prompt()
 
 
 def parse_decision(reply: str) -> Decision:
@@ -117,6 +130,66 @@ def parse_decision(reply: str) -> Decision:
         return Decision.model_validate_json(reply)
     except ValidationError:
         return Decision(action="wait", reason="could not parse reply")
+
+
+def request_decision(
+    model: Callable[[str], str],
+    prompt: str,
+    logger: RunLogger,
+    step: int,
+    danger_present: bool,
+) -> tuple[Decision, object | None]:
+    """Ask twice if needed, logging failures before choosing a safe fallback."""
+    attempt_prompt = prompt
+    last_reply: object | None = None
+
+    for attempt in range(1, 3):
+        try:
+            reply = model(attempt_prompt)
+            last_reply = reply
+        except Exception as error:  # noqa: BLE001 - isolate arbitrary model adapters
+            # Model adapters can fail because of timeouts, connection errors, or
+            # server errors. KeyboardInterrupt/SystemExit are intentionally not caught.
+            logger.log_model_failure(
+                {
+                    "step": step,
+                    "attempt": attempt,
+                    "failure_type": "model_call_error",
+                    "response": None,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+            continue
+
+        try:
+            return Decision.model_validate_json(reply), reply
+        except (ValidationError, TypeError, ValueError) as error:
+            logger.log_model_failure(
+                {
+                    "step": step,
+                    "attempt": attempt,
+                    "failure_type": "invalid_response",
+                    "response": reply,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+            if attempt == 1:
+                attempt_prompt = (
+                    prompt
+                    + "\n\nYour previous response was invalid:\n"
+                    + str(reply)[:4000]
+                    + "\n\nValidation error:\n"
+                    + str(error)
+                    + "\nReturn one corrected JSON object only."
+                )
+
+    action: Literal["pause", "wait"] = "pause" if danger_present else "wait"
+    reason = (
+        "model failed twice; paused because a threat is present"
+        if danger_present
+        else "model failed twice; waiting safely"
+    )
+    return Decision(action=action, reason=reason), last_reply
 
 
 def colonist_id(colonists: list[Colonist], name: str | None) -> int:
@@ -134,6 +207,7 @@ def run(
     events: EventListener | None = None,
     max_steps: int = 10,
     step_seconds: float = 5.0,
+    memory: AgentMemory | None = None,
 ) -> None:
     """Run the agent loop for max_steps steps."""
 
@@ -151,6 +225,8 @@ def run(
         ),
     }
     work_types = client.get_work_types()
+    if memory is None:
+        memory = AgentMemory()
     paused_by_agent: bool | None = None  # unknown until the agent acts
     last_threat_letter: GameEvent | None = None
 
@@ -193,10 +269,19 @@ def run(
                 new_events,
                 work_types,
                 pause_status,
+                memory,
             )
 
-            reply = model(prompt)
-            decision = parse_decision(reply)
+            danger_present = any(threat.active for threat in threats) or any(
+                event.category.startswith("Threat") for event in new_events
+            )
+            decision, reply = request_decision(
+                model,
+                prompt,
+                logger,
+                step,
+                danger_present,
+            )
             error = None
             try:
                 actions[decision.action](decision, colonists)
@@ -212,6 +297,15 @@ def run(
                 elif decision.action == "resume":
                     paused_by_agent = False
 
+            memory.remember_decision(
+                step,
+                decision.action,
+                decision.reason,
+                error,
+                decision.colonist,
+                decision.work_type,
+            )
+            memory.apply_update(step, state.game_tick, decision.memory_update)
             logger.log_decision(
                 {
                     "step": step,
@@ -220,6 +314,11 @@ def run(
                     "colonist": decision.colonist,
                     "work_type": decision.work_type,
                     "reason": decision.reason,
+                    "memory_update": (
+                        decision.memory_update.model_dump()
+                        if decision.memory_update
+                        else None
+                    ),
                     "pause_status": pause_status,
                     "error": error,
                 }

@@ -9,6 +9,7 @@ The agent loop itself lives elsewhere; this repo provides:
 | `rimagent/config.py` | Reads `OLLAMA_HOST` and `RIMAPI_URL` from the environment / `.env` |
 | `rimagent/rimapi.py` | RIMAPI client: `get_state()`, `pause()`, `resume()`, `start_game()`, `get_colonists()`, `get_alerts()`, `get_threats()`, `get_weather()`, `get_datetime()`, `get_work_types()`, `enable_work()`, `disable_work()` |
 | `rimagent/fake_model.py` | Fake model returning canned answers, for offline testing |
+| `rimagent/memory.py` | Persistent Markdown observations, structured JSON plans/policies, and recent decision memory |
 | `rimagent/runlog.py` | Writes state snapshots and decisions as JSON lines in `logs/` |
 | `scripts/smoke_test.py` | Reads state, pauses, resumes a live game |
 
@@ -27,8 +28,7 @@ Edit `.env` if your addresses differ from the defaults. It is not committed.
 
 ## Smoke test
 
-1. In RimWorld, turn on **Options > General > Run in background**. Without it the
-   game stops updating when its window loses focus, and every API request hangs.
+1. In RimWorld, turn on **Options > General > Run in background**.
 2. Start RimWorld with RIMAPI enabled and load a colony. RIMAPI listens on
    `http://localhost:8765` by default (the port is configurable in the mod settings).
 3. From the repo root, run:
@@ -39,6 +39,22 @@ python -m scripts.smoke_test
 
 It prints the colony's tick, colonist count and storyteller, then pauses and
 resumes the game, checking each step took effect.
+
+## Agent memory
+
+The agent stores durable, model-proposed memory under `memory/`:
+
+- `observations.md` is an append-only playthrough notebook.
+- `state.json` contains the current plan, non-live statuses, and policies.
+
+Live facts already read from RIMAPI (game state, colonists, alerts, threats,
+events, and work types) stay in the fresh prompt and are not copied into the
+structured memory. Memory files survive process restarts. Delete or archive the
+`memory/` directory yourself before starting a different colony.
+
+Invalid model responses and model-call errors are recorded as `model_failure`
+entries in the run log. The agent retries once with validation feedback. If both
+attempts fail, it pauses when a threat is present and otherwise waits.
 
 ## Work
 
