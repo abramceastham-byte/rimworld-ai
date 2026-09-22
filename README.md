@@ -7,7 +7,7 @@ The agent loop itself lives elsewhere; this repo provides:
 | File | What it does |
 |------|--------------|
 | `rimagent/config.py` | Reads `OLLAMA_HOST` and `RIMAPI_URL` from the environment / `.env` |
-| `rimagent/rimapi.py` | RIMAPI client: `get_state()`, `pause()`, `resume()`, `start_game()`, `get_colonists()`, `get_alerts()`, `get_threats()`, `get_weather()`, `get_datetime()`, `get_work_types()`, `enable_work()`, `disable_work()` |
+| `rimagent/rimapi.py` | RIMAPI client for game state, colonists, threats, work settings, work tables, recipes, bills, and game control |
 | `rimagent/fake_model.py` | Fake model returning canned answers, for offline testing |
 | `rimagent/memory.py` | Persistent Markdown observations, structured JSON plans/policies, and recent decision memory |
 | `rimagent/runlog.py` | Writes state snapshots and decisions as JSON lines in `logs/` |
@@ -62,6 +62,26 @@ The agent switches work on or off per colonist with `enable_work()` and
 `disable_work()`. It does not rank jobs: RIMAPI cannot turn on the game's
 **Manual priorities** setting, and without it RimWorld treats every enabled
 job the same.
+
+## Production bills
+
+Every agent step includes the spawned work tables, their exact recipe definition
+names, and their existing bills. The model can use `set_bill` to create or update
+one production bill using RimWorld's **Do until X** mode:
+
+```json
+{
+  "action": "set_bill",
+  "building_id": 14502,
+  "recipe_def_name": "CookMealSimple",
+  "target_count": 20,
+  "reason": "Maintain a reserve of 20 simple meals."
+}
+```
+
+The client checks that the recipe is actually available at that table. If the
+same recipe already has a bill, it updates and resumes that bill rather than
+creating a duplicate. Bill deletion is intentionally not exposed to the model.
 
 ## Starting a new colony from code
 

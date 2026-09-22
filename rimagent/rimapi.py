@@ -74,6 +74,49 @@ class Weather(BaseModel):
     temperature_c: float  # RIMAPI reports Celsius
 
 
+class MapPosition(BaseModel):
+    x: int
+    y: int = 0
+    z: int
+
+
+class Recipe(BaseModel):
+    """A bill recipe available at a particular work table."""
+
+    def_name: str
+    label: str
+    description: str = ""
+    work_amount: float | None = None
+    work_skill: str | None = None
+
+    model_config = {"extra": "allow"}
+
+
+class Bill(BaseModel):
+    """One production bill currently queued on a work table."""
+
+    load_id: int
+    recipe_def_name: str
+    repeat_mode: str = ""
+    repeat_count: int | None = None
+    target_count: int | None = None
+    suspended: bool = False
+
+    model_config = {"extra": "allow"}
+
+
+class WorkTable(BaseModel):
+    """A spawned building that can hold production bills."""
+
+    id: int
+    thing_def: str
+    label: str
+    position: MapPosition
+    bills_count: int = 0
+    recipes: list[Recipe] = Field(default_factory=list)
+    bills: list[Bill] = Field(default_factory=list)
+
+
 # What a hostile group's RimWorld "lord job" means, in plain words.
 # Names checked against RimWorld 1.6's own code. Unknown ones fall back to the raw name.
 THREAT_BEHAVIOURS = {
@@ -242,6 +285,30 @@ class RimApiClient:
             ))
         return threats
 
+    def get_work_tables(self, map_id: int = 0) -> list[WorkTable]:
+        """Work tables, their available recipes, and their current bills."""
+        tables = []
+        for raw_table in self._request(
+            "GET", "/api/v1/map/work-tables", params={"map_id": map_id}
+        ):
+            table_id = raw_table["id"]
+            recipes = self._request(
+                "GET",
+                "/api/v1/buildings/recipes",
+                params={"building_id": table_id},
+            )
+            bills = self._request(
+                "GET",
+                "/api/v1/buildings/bills",
+                params={"building_id": table_id},
+            )
+            tables.append(
+                WorkTable.model_validate(
+                    {**raw_table, "recipes": recipes or [], "bills": bills or []}
+                )
+            )
+        return tables
+
     # --- Acting on the colony ------------------------------------------------
 
     # Work is simply on or off: without "Manual priorities" ticked in the game's
@@ -262,6 +329,69 @@ class RimApiClient:
             "/api/v1/colonist/work-priority",
             json={"id": colonist_id, "work": work_type, "priority": priority},
         )
+
+    def set_target_bill(
+        self, building_id: int, recipe_def_name: str, target_count: int
+    ) -> None:
+        """Create or update a safe "do until X" production bill.
+
+        The recipe is checked against the table before anything is changed. If a
+        bill for the recipe already exists, update it instead of creating a
+        duplicate. This deliberately does not expose bill deletion to the model.
+        """
+        if target_count < 1:
+            raise ValueError("target_count must be at least 1")
+
+        recipes = [
+            Recipe.model_validate(recipe)
+            for recipe in self._request(
+                "GET",
+                "/api/v1/buildings/recipes",
+                params={"building_id": building_id},
+            )
+        ]
+        if recipe_def_name not in {recipe.def_name for recipe in recipes}:
+            raise ValueError(
+                f"recipe {recipe_def_name!r} is not available at work table "
+                f"{building_id}"
+            )
+
+        bills = [
+            Bill.model_validate(bill)
+            for bill in self._request(
+                "GET",
+                "/api/v1/buildings/bills",
+                params={"building_id": building_id},
+            )
+        ]
+        existing = next(
+            (bill for bill in bills if bill.recipe_def_name == recipe_def_name),
+            None,
+        )
+        body = {"repeat_mode": "TargetCount", "target_count": target_count}
+        if existing is None:
+            self._request(
+                "POST",
+                "/api/v1/buildings/bills/add",
+                params={"building_id": building_id},
+                json={"recipe_def_name": recipe_def_name, **body},
+            )
+            return
+
+        params = {"building_id": building_id, "bill_id": existing.load_id}
+        self._request(
+            "PUT",
+            "/api/v1/buildings/bill/update",
+            params=params,
+            json=body,
+        )
+        if existing.suspended:
+            self._request(
+                "PUT",
+                "/api/v1/buildings/bill/suspend",
+                params=params,
+                json={"suspended": False},
+            )
 
     def start_game(
         self,

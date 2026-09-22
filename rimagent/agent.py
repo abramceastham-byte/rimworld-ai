@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from rimagent.events import EventListener, GameEvent
 from rimagent.memory import AgentMemory, MemoryUpdate
@@ -16,6 +16,7 @@ from rimagent.rimapi import (
     RimApiClient,
     RimApiError,
     Threat,
+    WorkTable,
 )
 from rimagent.runlog import RunLogger
 
@@ -23,10 +24,17 @@ from rimagent.runlog import RunLogger
 class Decision(BaseModel):
     """What the model is allowed to answer. Anything else is rejected."""
 
-    action: Literal["pause", "resume", "wait", "enable_work", "disable_work"]
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal[
+        "pause", "resume", "wait", "enable_work", "disable_work", "set_bill"
+    ]
     reason: str = ""
     colonist: str | None = None  # a colonist's name, for enable_work / disable_work
     work_type: str | None = None  # e.g. "Cooking", for enable_work / disable_work
+    building_id: int | None = Field(default=None, gt=0)
+    recipe_def_name: str | None = None
+    target_count: int | None = Field(default=None, ge=1, le=500)
     memory_update: MemoryUpdate | None = None
 
     @model_validator(mode="after")
@@ -37,13 +45,24 @@ class Decision(BaseModel):
             self.colonist and self.work_type
         ):
             raise ValueError(f"{self.action} needs both colonist and work_type")
+        if self.action == "set_bill" and not (
+            self.building_id and self.recipe_def_name and self.target_count
+        ):
+            raise ValueError(
+                "set_bill needs building_id, recipe_def_name, and target_count"
+            )
         return self
-
+ 
 
 INSTRUCTIONS = (
     "You are managing a RimWorld colony.\n"
-    "Choose exactly one action: pause, resume, wait, enable_work, disable_work.\n"
+    "Choose exactly one action: pause, resume, wait, enable_work, disable_work, "
+    "set_bill.\n"
     "enable_work / disable_work switch one kind of work on or off for one colonist.\n"
+    "set_bill creates or updates one work-table bill in TargetCount mode (the "
+    "in-game 'Do until X' setting). Use an exact work-table id and recipe def name "
+    "from the current state. Prefer updating an existing useful bill instead of "
+    "creating competing food recipes. target_count must be between 1 and 500.\n"
     "You may include an optional memory_update object. Use observation only for "
     "durable insights worth remembering across the playthrough. Use replace_plan, "
     "status_updates, and policy changes for intentions and strategy.\n"
@@ -53,6 +72,8 @@ INSTRUCTIONS = (
     "Reply only with JSON, like one of these:\n"
     '{"action": "wait", "reason": "short explanation"}\n'
     '{"action": "enable_work", "colonist": "Skye", "work_type": "Cooking", "reason": "..."}\n'
+    '{"action": "set_bill", "building_id": 14502, "recipe_def_name": '
+    '"CookMealSimple", "target_count": 20, "reason": "Maintain 20 meals."}\n'
     '{"action": "wait", "reason": "planning", "memory_update": '
     '{"replace_plan": {"objective": "Stabilize food production", "status": "active", '
     '"steps": [{"description": "Assign a capable cook", "status": "pending"}]}, '
@@ -90,6 +111,36 @@ def describe_pause(
     return "Game is paused by the player or an open menu."
 
 
+def describe_work_table(table: WorkTable) -> list[str]:
+    """Describe one table without making the model invent ids or recipe names."""
+    position = f"({table.position.x}, {table.position.z})"
+    lines = [
+        f"- {table.label} [{table.thing_def}], id {table.id}, at {position}:"
+    ]
+    if table.bills:
+        lines.append("  Current bills:")
+        for bill in table.bills:
+            count = (
+                bill.target_count
+                if bill.target_count is not None
+                else bill.repeat_count
+            )
+            count_text = f", count {count}" if count is not None else ""
+            suspended = ", suspended" if bill.suspended else ""
+            lines.append(
+                f"  - bill {bill.load_id}: {bill.recipe_def_name}, "
+                f"{bill.repeat_mode or 'unknown mode'}{count_text}{suspended}"
+            )
+    else:
+        lines.append("  Current bills: none.")
+
+    recipes = ", ".join(
+        f"{recipe.def_name} ({recipe.label})" for recipe in table.recipes
+    )
+    lines.append("  Available recipes: " + (recipes or "none."))
+    return lines
+
+
 def build_prompt(
     state: GameState,
     colonists: list[Colonist],
@@ -97,6 +148,7 @@ def build_prompt(
     threats: list[Threat],
     events: list[GameEvent],
     work_types: list[str],
+    work_tables: list[WorkTable],
     pause_status: str,
     memory: AgentMemory,
 ) -> str:
@@ -119,6 +171,12 @@ def build_prompt(
         *[describe_colonist(c) for c in colonists],
         "",
         "Work types: " + ", ".join(work_types) + ".",
+        "",
+        "Work tables and production bills:",
+        *(
+            [line for table in work_tables for line in describe_work_table(table)]
+            or ["None. Build a work table before trying to set a bill."]
+        ),
         "",
     ]
     return "\n".join(lines) + INSTRUCTIONS + "\n" + memory.to_prompt()
@@ -223,6 +281,9 @@ def run(
         "disable_work": lambda d, cols: client.disable_work(
             colonist_id(cols, d.colonist), d.work_type
         ),
+        "set_bill": lambda d, cols: client.set_target_bill(
+            d.building_id, d.recipe_def_name, d.target_count
+        ),
     }
     work_types = client.get_work_types()
     if memory is None:
@@ -237,6 +298,7 @@ def run(
                 colonists = client.get_colonists()
                 alerts = client.get_alerts()
                 threats = client.get_threats()
+                work_tables = client.get_work_tables()
             except (RimApiError, httpx.TimeoutException) as e:
                 print(f"Step {step}: could not read game state: {e}")
                 time.sleep(step_seconds)
@@ -268,6 +330,7 @@ def run(
                 threats,
                 new_events,
                 work_types,
+                work_tables,
                 pause_status,
                 memory,
             )
@@ -313,6 +376,9 @@ def run(
                     "action": decision.action,
                     "colonist": decision.colonist,
                     "work_type": decision.work_type,
+                    "building_id": decision.building_id,
+                    "recipe_def_name": decision.recipe_def_name,
+                    "target_count": decision.target_count,
                     "reason": decision.reason,
                     "memory_update": (
                         decision.memory_update.model_dump()
