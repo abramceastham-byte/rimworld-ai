@@ -315,9 +315,17 @@ class DecisionTests(unittest.TestCase):
 
     def test_complete_map_action_parses(self) -> None:
         decision = Decision.model_validate_json(
-            '{"action": "create_stockpile", "x1": 5, "z1": 9, "x2": 2, "z2": 3}'
+            '{"action": "create_stockpile", "x1": 5, "z1": 9, "x2": 2, "z2": 3, '
+            '"reason": "Store the supplies."}'
         )
         self.assertEqual(decision.rect(), Rect(2, 3, 5, 9))
+
+    def test_reason_is_required(self) -> None:
+        with self.assertRaises(ValidationError):
+            Decision.model_validate_json('{"action": "wait"}')
+        with self.assertRaises(ValidationError):
+            Decision.model_validate_json('{"action": "wait", "reason": ""}')
+        self.assertIn("reason", Decision.model_json_schema()["required"])  # so Ollama enforces it
 
 
 if __name__ == "__main__":

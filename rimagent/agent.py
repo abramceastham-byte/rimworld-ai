@@ -55,7 +55,7 @@ class Decision(BaseModel):
         "allow_items",
         "chop_trees",
     ]
-    reason: str = ""
+    reason: str = Field(min_length=1, max_length=300)
     colonist: str | None = None  # a colonist's name, for enable_work / disable_work
     work_type: str | None = None  # e.g. "Cooking", for enable_work / disable_work
     building_id: int | None = Field(default=None, gt=0)
@@ -106,7 +106,8 @@ REQUIRED_FIELDS = {
 INSTRUCTIONS = (
     "You are managing a RimWorld colony.\n"
     "Choose exactly one action: pause, resume, wait, enable_work, disable_work, "
-    "set_bill.\n"
+    "set_bill, create_growing_zone, create_stockpile, place_blueprint, designate, "
+    "allow_items, chop_trees.\n"
     "enable_work / disable_work switch one kind of work on or off for one colonist.\n"
     "set_bill creates or updates one work-table bill in TargetCount mode (the "
     "in-game 'Do until X' setting). Use an exact work-table id and recipe def name "
@@ -134,27 +135,33 @@ INSTRUCTIONS = (
     "Do not store live facts already supplied every step: pause state, tick, wealth, "
     "storyteller, colonist count, alerts, threats, colonist age/health/mood/hunger/job/"
     "skills/work settings, new events, or available work types.\n"
-    "Reply only with JSON, like one of these:\n"
-    '{"action": "wait", "reason": "short explanation"}\n'
-    '{"action": "enable_work", "colonist": "Skye", "work_type": "Cooking", "reason": "..."}\n'
-    '{"action": "set_bill", "building_id": 14502, "recipe_def_name": '
-    '"CookMealSimple", "target_count": 20, "reason": "Maintain 20 meals."}\n'
-    '{"action": "create_growing_zone", "plant": "Plant_Potato", "x1": 130, "z1": 95, '
-    '"x2": 136, "z2": 101, "reason": "Start a food crop."}\n'
-    '{"action": "create_stockpile", "x1": 140, "z1": 95, "x2": 144, "z2": 99, '
-    '"reason": "Somewhere to store the loose supplies."}\n'
-    '{"action": "place_blueprint", "building_def": "Bed", "x": 138, "z": 104, '
-    '"rotation": 0, "stuff": "WoodLog", "reason": "Everyone needs a bed."}\n'
-    '{"action": "designate", "designation": "harvest", "x1": 120, "z1": 90, '
-    '"x2": 135, "z2": 105, "reason": "Collect ripe wild berries."}\n'
-    '{"action": "allow_items", "x1": 128, "z1": 100, "x2": 142, "z2": 112, '
-    '"reason": "Let colonists use the crash supplies."}\n'
-    '{"action": "chop_trees", "x1": 130, "z1": 88, "x2": 145, "z2": 96, '
-    '"reason": "Wood for beds and walls."}\n'
-    '{"action": "wait", "reason": "planning", "memory_update": '
-    '{"replace_plan": {"objective": "Stabilize food production", "status": "active", '
-    '"steps": [{"description": "Assign a capable cook", "status": "pending"}]}, '
-    '"policies_to_add": ["Keep at least one capable colonist assigned to cooking"]}}\n'
+    "Reply with one JSON object only. The templates below show the shape of each "
+    "reply; they are not suggestions. Replace every <...> with a value you read from "
+    "the current state above (a real colonist name, a work-table id, a def name from "
+    "the lists, coordinates from the Map). Always include a short reason.\n"
+    '{"action": "wait", "reason": "<why>"}\n'
+    '{"action": "enable_work", "colonist": "<colonist name>", "work_type": "<work type>", '
+    '"reason": "<why>"}\n'
+    '{"action": "set_bill", "building_id": <work-table id>, "recipe_def_name": '
+    '"<recipe def name from that table>", "target_count": <1-500>, "reason": "<why>"}\n'
+    '{"action": "create_growing_zone", "plant": "<crop def name>", "x1": <x>, "z1": <z>, '
+    '"x2": <x>, "z2": <z>, "reason": "<why>"}\n'
+    '{"action": "create_stockpile", "x1": <x>, "z1": <z>, "x2": <x>, "z2": <z>, '
+    '"reason": "<why>"}\n'
+    '{"action": "place_blueprint", "building_def": "<buildable def name>", "x": <x>, '
+    '"z": <z>, "rotation": <0-3>, "stuff": "<material, if the building lists any>", '
+    '"reason": "<why>"}\n'
+    '{"action": "designate", "designation": "<mine|harvest|hunt>", "x1": <x>, "z1": <z>, '
+    '"x2": <x>, "z2": <z>, "reason": "<why>"}\n'
+    '{"action": "allow_items", "x1": <x>, "z1": <z>, "x2": <x>, "z2": <z>, '
+    '"reason": "<why>"}\n'
+    '{"action": "chop_trees", "x1": <x>, "z1": <z>, "x2": <x>, "z2": <z>, '
+    '"reason": "<why>"}\n'
+    "Any reply may also carry a memory_update, for example:\n"
+    '{"action": "<action>", "reason": "<why>", "memory_update": {"replace_plan": '
+    '{"objective": "<your objective>", "status": "active", "steps": [{"description": '
+    '"<a step>", "status": "pending"}]}, "policies_to_add": ["<a rule you will follow>"]}}\n'
+    "Mark a plan step completed only once the current state shows it is done.\n"
 )
 
 
@@ -422,6 +429,7 @@ def request_decision(
                     "attempt": attempt,
                     "failure_type": "invalid_response",
                     "response": reply,
+                    "thinking": getattr(model, "last_thinking", None),
                     "error": f"{type(error).__name__}: {error}",
                 }
             )
@@ -634,6 +642,10 @@ def run(
                     ),
                     "pause_status": pause_status,
                     "error": error,
+                    # The model's reasoning, for reading later. It is not put
+                    # back into the next prompt. None for models without it.
+                    "thinking": getattr(model, "last_thinking", None),
+                    "model_stats": getattr(model, "last_stats", None),
                 }
             )
             print(f"Step {step}: {decision.action} ({decision.reason})")

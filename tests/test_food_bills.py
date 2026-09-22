@@ -29,6 +29,7 @@ class DecisionTests(unittest.TestCase):
             building_id=12,
             recipe_def_name="CookMealSimple",
             target_count=20,
+            reason="Keep meals stocked.",
         )
         self.assertEqual(decision.target_count, 20)
 

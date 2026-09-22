@@ -34,6 +34,10 @@ class RunLogger:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, default=str) + "\n")
 
+    def log_run_info(self, info: Any) -> None:
+        """Record how a run was set up (model, thinking, context size), once at the start."""
+        self._write("run", info)
+
     def log_state(self, state: Any) -> None:
         """Record a game state snapshot (a GameState or any JSON-friendly value)."""
         self._write("state", state)

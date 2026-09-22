@@ -134,6 +134,28 @@ with RimApiClient() as client:
     ))
 ```
 
+## Running a real model
+
+With Ollama reachable at `OLLAMA_HOST` (see the SSH tunnel section below):
+
+```bash
+# One decision about the live colony, printed and saved to logs/dry-run-*.json,
+# never acted on. Use it after changing the prompt or to compare models.
+python -m scripts.dry_run qwen3:14b --think on
+
+# A real run: the model plays for 20 steps.
+python -m scripts.run_agent --model qwen3:14b --think off --steps 20
+python -m scripts.run_agent --model gpt-oss:20b --think low --steps 20
+```
+
+`--think` is `on`/`off` for qwen3 and `low`/`medium`/`high` for gpt-oss (which
+can't switch it off). Each run log starts with a `run` record naming the model
+and settings, and every `decision` record includes the model's `thinking` and
+timings. The thinking is only logged; it is never fed back into the next prompt.
+Leave out `--model` to use the fake model. `--num-ctx` (default 16384) sets the
+context window; Ollama's own default is smaller than the prompt and would
+silently cut it off.
+
 ## Running the model on a lab machine (SSH tunnel)
 
 Ollama can run on a more powerful lab machine while RimWorld and the agent
