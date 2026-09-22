@@ -84,6 +84,23 @@ The client checks that the recipe is actually available at that table. If the
 same recipe already has a bill, it updates and resumes that bill rather than
 creating a duplicate. Bill deletion is intentionally not exposed to the model.
 
+## What the model sees and does each step
+
+A reply is a **turn**: 1 to 5 actions carried out in order, each checked on its
+own, with the results reported back in the next prompt. Several actions at once
+(with the game paused) let it lay out a room or set up a colonist in one go.
+
+The prompt includes a mini-map around the colony showing terrain, colonists,
+trees, forbidden items, **the colony's own buildings, frames and blueprints**,
+plus what supplies are **usable now versus forbidden** (so "no usable Steel" is
+visible before it plans a steel building), and the live status of every
+blueprint it placed.
+
+Plan and policy changes in a reply are **ignored when one of its actions
+failed** (`honest_memory_update`), since a failed action changes nothing; the
+reply's observation is still kept. Each run log records the full prompt with the
+first action of every turn.
+
 ## Zones, blueprints and designations
 
 The model can shape the map with four actions. Each step's prompt includes
@@ -94,7 +111,7 @@ the agent has placed, and the buildings and crops it may use.
 |--------|--------------|--------|
 | `create_growing_zone` | Plants one crop in a rectangle | 225 cells; every cell fertile enough for the crop; food/fibre crops only |
 | `create_stockpile` | Storage for all normal items | 225 cells; not on water or marsh |
-| `place_blueprint` | One building for colonists to construct | Catalog buildings only, research finished, valid material |
+| `place_blueprint` | One building for colonists to construct | Catalog buildings only, research finished, valid material, no overlap with an existing blueprint or frame |
 | `designate` | Mine rock, harvest ripe plants, or hunt animals in a rectangle | 400 cells |
 
 RIMAPI does little checking of its own here (unknown names are skipped while it

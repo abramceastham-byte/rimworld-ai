@@ -16,7 +16,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from rimagent.agent import Decision, TimeMode, build_prompt, describe_map, describe_time
+from rimagent.agent import TimeMode, Turn, build_prompt, describe_map, describe_time
 from rimagent.blueprints import BlueprintTracker
 from rimagent.memory import AgentMemory
 from rimagent.ollama_model import OllamaModel, parse_think
@@ -39,7 +39,7 @@ def live_prompt(client: RimApiClient) -> str:
     map_lines = describe_map(
         colonists, client.get_terrain(), client.get_game_defs(), client.get_zones(), [],
         client.get_finished_research(), client.get_items(), client.get_trees(),
-        blueprints.check(client, forget_finished=False),
+        blueprints.check(client, forget_finished=False), client.get_buildings(),
     )
     return build_prompt(
         state, colonists, client.get_alerts(), client.get_threats(), [], client.get_work_types(),
@@ -59,7 +59,7 @@ def main() -> None:
 
     model = OllamaModel(
         args.model,
-        schema=None if args.no_schema else Decision.model_json_schema(),
+        schema=None if args.no_schema else Turn.model_json_schema(),
         think=parse_think(args.think),
         num_ctx=args.num_ctx,
     )
@@ -70,7 +70,7 @@ def main() -> None:
 
     reply = model(prompt)
     try:
-        decision = Decision.model_validate_json(reply).model_dump(exclude_none=True)
+        decision = Turn.model_validate_json(reply).model_dump(exclude_none=True)
         problem = None
     except (ValidationError, ValueError) as e:
         decision, problem = None, str(e)

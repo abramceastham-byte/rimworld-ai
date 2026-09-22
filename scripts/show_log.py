@@ -93,7 +93,8 @@ def describe_memory(update: dict[str, Any] | None) -> list[str]:
 def run_to_markdown(path: Path) -> str:
     records = read_log(path)
     info = next((r["data"] for r in records if r["kind"] == "run"), {})
-    decisions = [r["data"] for r in records if r["kind"] == "decision"]
+    decisions = [r["data"] for r in records
+                 if r["kind"] == "decision" and r["data"].get("action") != "turn_end"]
     failures = [r["data"] for r in records if r["kind"] == "model_failure"]
 
     # The folder name says which run this is (run.jsonl is the same everywhere).
@@ -127,17 +128,29 @@ def run_to_markdown(path: Path) -> str:
             events.append(data)
         elif kind == "model_failure":
             step_failures.append(data)
+        elif kind == "decision" and data.get("action") == "turn_end":
+            out += time_after_markdown(data.get("time_after"))
         elif kind == "decision":
             out += step_to_markdown(data, state, events, step_failures)
             events, step_failures = [], []
     return "\n".join(out)
 
 
+def time_after_markdown(after: object) -> list[str]:
+    """The stretch of game time the loop allowed after a turn's actions."""
+    if isinstance(after, dict):
+        ran = f"**Then:** the game ran {after.get('seconds')}s ({after.get('ticks')} ticks)"
+        return [ran + (f", stopped early: {after['stopped_by']}" if after.get("stopped_by") else ""), ""]
+    return [f"**Then:** {after}, no time passed", ""] if after else []
+
+
 def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) -> list[str]:
     error = d.get("error")
     outcome = "FAILED" if error else "ok"
-    out = [f"## Step {d.get('step', '?')}: {d['action']} ({outcome})", ""]
-    if state:
+    index, total = d.get("action_index"), d.get("actions_in_turn") or 1
+    number = f"{d.get('step', '?')}" if total == 1 or index is None else f"{d.get('step', '?')}.{index}"
+    out = [f"## Step {number}: {d['action']} ({outcome})", ""]
+    if state and (index in (None, 0)):
         mode = d.get("time_mode")
         if mode:
             if mode.get("paused"):
@@ -162,12 +175,6 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
     if targets:
         out += targets + [""]
     out += [f"**Result:** {'FAILED: ' + error if error else 'done'}", ""]
-    after = d.get("time_after")
-    if isinstance(after, dict):
-        ran = f"**Then:** the game ran {after.get('seconds')}s ({after.get('ticks')} ticks)"
-        out += [ran + (f", stopped early: {after['stopped_by']}" if after.get("stopped_by") else ""), ""]
-    elif after:
-        out += [f"**Then:** {after}, no time passed", ""]
     out += describe_memory(d.get("memory_update"))
     for f in failures:
         out.append(f"**Attempt {f.get('attempt')} rejected** ({f.get('failure_type')}): `{f.get('error')}`")
@@ -180,6 +187,7 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
         out += [f"*Model: {stats.get('seconds')}s, {stats.get('prompt_tokens')} prompt tokens, "
                 f"{stats.get('output_tokens')} output tokens*", ""]
     out += block(d.get("thinking"), "Model reasoning")
+    out += block(d.get("prompt"), "Prompt sent to the model")
     for f in failures:
         out += block(f.get("thinking"), f"Reasoning behind rejected attempt {f.get('attempt')}")
     return out

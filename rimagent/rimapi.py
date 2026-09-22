@@ -143,6 +143,27 @@ class MapThing(BaseModel):
     is_forbidden: bool = False
 
 
+class Building(BaseModel):
+    """A colony building from /map/buildings: finished, or a frame being built."""
+
+    id: int
+    def_name: str = Field(alias="def")
+    label: str = ""
+    position: MapPosition
+    rotation: int = 0
+    size: MapPosition = MapPosition(x=1, z=1)
+    type: str = ""  # "Building", "Frame", "Building_Bed", "Building_WorkTable", ...
+
+    model_config = {"populate_by_name": True}
+
+    @property
+    def under_construction(self) -> bool:
+        return self.type == "Frame" or self.def_name.startswith("Frame_")
+
+    def area(self) -> Rect:
+        return footprint(self.position.x, self.position.z, (self.size.x, self.size.z), self.rotation)
+
+
 class Zone(BaseModel):
     """A growing zone or stockpile. RIMAPI reports its size but not its location."""
 
@@ -511,6 +532,11 @@ class RimApiClient:
         data = self._request("GET", "/api/v1/map/terrain", params={"map_id": map_id})
         return TerrainMap(data["width"], data["height"], data["palette"], data["grid"])
 
+    def get_buildings(self, map_id: int = 0) -> list[Building]:
+        """The colony's own buildings, including frames under construction."""
+        return [Building.model_validate(b) for b in
+                self._request("GET", "/api/v1/map/buildings", params={"map_id": map_id})]
+
     def get_zones(self, map_id: int = 0) -> list[Zone]:
         """Growing zones and stockpiles (not the Home/roof areas)."""
         data = self._request("GET", "/api/v1/map/zones", params={"map_id": map_id})
@@ -620,6 +646,20 @@ class RimApiClient:
 
         area = footprint(x, z, spec.size, rotation)
         _check_rect(area, self.get_terrain(map_id), spec.size[0] * spec.size[1])
+
+        # check-zone can't see blueprints or frames (RimWorld treats them as
+        # non-physical), and the game will happily stack blueprints on top of
+        # each other, so check the footprint cell by cell first.
+        for cell_x, cell_z in area:
+            for thing in self.get_things_at(cell_x, cell_z, map_id):
+                if thing.def_name.startswith(("Blueprint_", "Frame_")):
+                    planned = thing.def_name.split("_", 1)[1]
+                    state = "already being built" if thing.def_name.startswith("Frame_") else "already planned"
+                    raise ValueError(
+                        f"{def_name} at ({x},{z}) would cover ({cell_x},{cell_z}), where "
+                        f"{planned} is {state}"
+                    )
+
         check = self.check_area(area, map_id)
         # Buildings are fine inside stockpiles (shelves belong there), but would
         # eat into a growing zone.

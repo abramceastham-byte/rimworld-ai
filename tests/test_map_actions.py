@@ -51,12 +51,14 @@ class FakeRimApi:
         research: list[str] | None = None,
         items: list[dict] | None = None,
         plants: list[dict] | None = None,
+        things_at: dict | None = None,
     ):
         self.calls: list[tuple[str, str, dict]] = []
         self.issues = issues or {}
         self.research = research if research is not None else ["ComplexFurniture"]
         self.items = items or []
         self.plants = plants or []
+        self.things_at = things_at or {}
 
     def __call__(self, method: str, path: str, **kwargs):
         self.calls.append((method, path, kwargs))
@@ -76,6 +78,9 @@ class FakeRimApi:
             return self.items
         if path == "/api/v1/map/plants":
             return self.plants
+        if path == "/api/v1/map/things-at":
+            cell = kwargs["json"]["position"]
+            return self.things_at.get((cell["x"], cell["z"]), [])
         return None
 
     def writes(self) -> list[tuple[str, str, dict]]:
@@ -215,6 +220,20 @@ class BlueprintTests(MapTestCase):
         fake = FakeRimApi()
         with self.assertRaisesRegex(ValueError, "not in the building catalog"):
             self.client_with(fake).place_blueprint("ShipReactor", 4, 4)
+        self.assertEqual(fake.writes(), [])
+
+    def test_refuses_overlapping_blueprints_and_frames(self) -> None:
+        # check-zone can't see blueprints or frames, so place_blueprint checks cells.
+        fake = FakeRimApi(things_at={(4, 5): [{"thing_id": 1, "def_name": "Blueprint_Wall",
+                                               "position": {"x": 4, "y": 0, "z": 5}}]})
+        with self.assertRaisesRegex(ValueError, r"\(4,5\), where Wall is already planned"):
+            self.client_with(fake).place_blueprint("Bed", 4, 4, stuff="WoodLog")
+        self.assertEqual(fake.writes(), [])
+
+        fake = FakeRimApi(things_at={(4, 4): [{"thing_id": 2, "def_name": "Frame_Bed",
+                                               "position": {"x": 4, "y": 0, "z": 4}}]})
+        with self.assertRaisesRegex(ValueError, "Bed is already being built"):
+            self.client_with(fake).place_blueprint("Wall", 4, 4, stuff="WoodLog")
         self.assertEqual(fake.writes(), [])
 
     def test_refuses_blocked_footprints(self) -> None:

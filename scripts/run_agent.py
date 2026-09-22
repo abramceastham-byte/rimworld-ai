@@ -16,7 +16,7 @@ import argparse
 
 import httpx
 
-from rimagent.agent import Decision, run
+from rimagent.agent import Turn, run
 from rimagent.events import EventListener
 from rimagent.fake_model import make_fake_model
 from rimagent.ollama_model import OllamaModel, parse_think
@@ -37,13 +37,13 @@ def main() -> None:
                         help="Game speed while running: 1 normal, 2 fast, 3 superfast.")
     parser.add_argument("--num-ctx", type=int, default=16384, help="Model context window in tokens.")
     parser.add_argument("--no-schema", action="store_true",
-                        help="Don't force the reply to match Decision's JSON schema.")
+                        help="Don't force the reply to match the Turn JSON schema.")
     args = parser.parse_args()
 
     if args.model:
         model = OllamaModel(
             args.model,
-            schema=None if args.no_schema else Decision.model_json_schema(),
+            schema=None if args.no_schema else Turn.model_json_schema(),
             think=parse_think(args.think),
             num_ctx=args.num_ctx,
         )
