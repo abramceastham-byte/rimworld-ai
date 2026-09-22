@@ -7,16 +7,28 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from rimagent.construction import (
+    CROPS,
+    MAX_DESIGNATE_CELLS,
+    MAX_ZONE_CELLS,
+    STUFF_BY_CATEGORY,
+    Rect,
+    TerrainMap,
+    available_buildings,
+    map_symbol,
+)
 from rimagent.events import EventListener, GameEvent
 from rimagent.memory import AgentMemory, MemoryUpdate
 from rimagent.rimapi import (
     Alert,
     Colonist,
+    GameDefs,
     GameState,
     RimApiClient,
     RimApiError,
     Threat,
     WorkTable,
+    Zone,
 )
 from rimagent.runlog import RunLogger
 
@@ -27,7 +39,16 @@ class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: Literal[
-        "pause", "resume", "wait", "enable_work", "disable_work", "set_bill"
+        "pause",
+        "resume",
+        "wait",
+        "enable_work",
+        "disable_work",
+        "set_bill",
+        "create_growing_zone",
+        "create_stockpile",
+        "place_blueprint",
+        "designate",
     ]
     reason: str = ""
     colonist: str | None = None  # a colonist's name, for enable_work / disable_work
@@ -35,24 +56,45 @@ class Decision(BaseModel):
     building_id: int | None = Field(default=None, gt=0)
     recipe_def_name: str | None = None
     target_count: int | None = Field(default=None, ge=1, le=500)
+    # A rectangle, for create_growing_zone / create_stockpile / designate.
+    x1: int | None = Field(default=None, ge=0)
+    z1: int | None = Field(default=None, ge=0)
+    x2: int | None = Field(default=None, ge=0)
+    z2: int | None = Field(default=None, ge=0)
+    plant: str | None = None  # for create_growing_zone, e.g. "Plant_Potato"
+    designation: Literal["mine", "harvest", "hunt"] | None = None
+    # One building, for place_blueprint.
+    building_def: str | None = None
+    x: int | None = Field(default=None, ge=0)
+    z: int | None = Field(default=None, ge=0)
+    rotation: int = Field(default=0, ge=0, le=3)
+    stuff: str | None = None  # material, e.g. "WoodLog"
     memory_update: MemoryUpdate | None = None
 
     @model_validator(mode="after")
-    def work_actions_need_a_target(self) -> "Decision":
+    def actions_have_their_fields(self) -> "Decision":
         # Runs after the fields are checked. Raising here makes parsing fail,
-        # so parse_decision turns an incomplete work action into "wait".
-        if self.action in ("enable_work", "disable_work") and not (
-            self.colonist and self.work_type
-        ):
-            raise ValueError(f"{self.action} needs both colonist and work_type")
-        if self.action == "set_bill" and not (
-            self.building_id and self.recipe_def_name and self.target_count
-        ):
-            raise ValueError(
-                "set_bill needs building_id, recipe_def_name, and target_count"
-            )
+        # so an incomplete action is rejected instead of half-run.
+        missing = [f for f in REQUIRED_FIELDS.get(self.action, ()) if getattr(self, f) is None]
+        if missing:
+            raise ValueError(f"{self.action} needs {', '.join(missing)}")
         return self
- 
+
+    def rect(self) -> Rect:
+        return Rect.from_corners(self.x1, self.z1, self.x2, self.z2)
+
+
+RECT = ("x1", "z1", "x2", "z2")
+REQUIRED_FIELDS = {
+    "enable_work": ("colonist", "work_type"),
+    "disable_work": ("colonist", "work_type"),
+    "set_bill": ("building_id", "recipe_def_name", "target_count"),
+    "create_growing_zone": ("plant", *RECT),
+    "create_stockpile": RECT,
+    "place_blueprint": ("building_def", "x", "z"),
+    "designate": ("designation", *RECT),
+}
+
 
 INSTRUCTIONS = (
     "You are managing a RimWorld colony.\n"
@@ -63,6 +105,17 @@ INSTRUCTIONS = (
     "in-game 'Do until X' setting). Use an exact work-table id and recipe def name "
     "from the current state. Prefer updating an existing useful bill instead of "
     "creating competing food recipes. target_count must be between 1 and 500.\n"
+    "Map actions use cell coordinates from the Map section: x grows east, z grows north.\n"
+    f"create_growing_zone plants one crop in the rectangle x1,z1 to x2,z2 (at most "
+    f"{MAX_ZONE_CELLS} cells; every cell needs fertile soil). create_stockpile makes a "
+    f"storage zone for all normal items. designate marks everything of one kind in a "
+    f"rectangle (at most {MAX_DESIGNATE_CELLS} cells): mine (rock), harvest (ripe plants) "
+    "or hunt (wild animals; dangerous ones can fight back).\n"
+    "place_blueprint places one building from the buildable list at x,z, with rotation "
+    "0 north, 1 east, 2 south or 3 west, and a stuff material if the building lists "
+    "any. Colonists then build it if they have Construction enabled and materials.\n"
+    "Keep new zones and buildings near the colonists and away from each other. If an "
+    "area is blocked, the action fails with the reason, so pick another spot.\n"
     "You may include an optional memory_update object. Use observation only for "
     "durable insights worth remembering across the playthrough. Use replace_plan, "
     "status_updates, and policy changes for intentions and strategy.\n"
@@ -74,6 +127,14 @@ INSTRUCTIONS = (
     '{"action": "enable_work", "colonist": "Skye", "work_type": "Cooking", "reason": "..."}\n'
     '{"action": "set_bill", "building_id": 14502, "recipe_def_name": '
     '"CookMealSimple", "target_count": 20, "reason": "Maintain 20 meals."}\n'
+    '{"action": "create_growing_zone", "plant": "Plant_Potato", "x1": 130, "z1": 95, '
+    '"x2": 136, "z2": 101, "reason": "Start a food crop."}\n'
+    '{"action": "create_stockpile", "x1": 140, "z1": 95, "x2": 144, "z2": 99, '
+    '"reason": "Somewhere to store the loose supplies."}\n'
+    '{"action": "place_blueprint", "building_def": "Bed", "x": 138, "z": 104, '
+    '"rotation": 0, "stuff": "WoodLog", "reason": "Everyone needs a bed."}\n'
+    '{"action": "designate", "designation": "harvest", "x1": 120, "z1": 90, '
+    '"x2": 135, "z2": 105, "reason": "Collect ripe wild berries."}\n'
     '{"action": "wait", "reason": "planning", "memory_update": '
     '{"replace_plan": {"objective": "Stabilize food production", "status": "active", '
     '"steps": [{"description": "Assign a capable cook", "status": "pending"}]}, '
@@ -141,6 +202,83 @@ def describe_work_table(table: WorkTable) -> list[str]:
     return lines
 
 
+MINIMAP_RADIUS = 12
+
+
+def colony_center(colonists: list[Colonist]) -> tuple[int, int] | None:
+    spots = [c.position for c in colonists if c.position]
+    if not spots:
+        return None
+    return (round(sum(p.x for p in spots) / len(spots)), round(sum(p.z for p in spots) / len(spots)))
+
+
+def describe_map(
+    colonists: list[Colonist],
+    terrain: TerrainMap,
+    defs: GameDefs,
+    zones: list[Zone],
+    placements: list[str],
+    finished_research: set[str],
+) -> list[str]:
+    """Everything the model needs to pick coordinates without inventing them."""
+    lines = [f"Map: {terrain.width} x {terrain.height} cells. x grows east, z grows north."]
+    for c in colonists:
+        if c.position:
+            lines.append(f"- {c.name} is at ({c.position.x}, {c.position.z}).")
+
+    center = colony_center(colonists)
+    if center:
+        cx, cz = center
+        r = MINIMAP_RADIUS
+        x1, x2 = max(0, cx - r), min(terrain.width - 1, cx + r)
+        z1, z2 = max(0, cz - r), min(terrain.height - 1, cz + r)
+        at_colonist = {(c.position.x, c.position.z) for c in colonists if c.position}
+        lines += [
+            "",
+            f"Terrain around the colony, x {x1}-{x2} left to right, z {z2} (top) down to {z1}:",
+            "  R rich soil  . soil (any crop)  , poor soil  _ stone/floor, nothing grows",
+            "  ~ water/marsh (no heavy building)  @ colonist",
+            "  Rock, trees and items are not shown; blocked spots are rejected with a reason.",
+        ]
+        for z in range(z2, z1 - 1, -1):
+            row = "".join(
+                "@" if (x, z) in at_colonist else map_symbol(defs.terrain.get(terrain.at(x, z)))
+                for x in range(x1, x2 + 1)
+            )
+            lines.append(f"  z={z:3d} {row}")
+
+    lines += ["", "Zones: " + (", ".join(f"{z.label} ({z.type}, {z.cells_count} cells)" for z in zones) or "none") + "."]
+    lines.append("Placed by you: " + ("; ".join(placements) or "nothing yet") + ".")
+
+    buildable = available_buildings(finished_research)
+    lines += ["", "Buildable (def name, size facing north, material types):"]
+    for name, spec in buildable.items():
+        material = "/".join(spec.stuff) if spec.stuff else "fixed cost"
+        lines.append(f"- {name} ({spec.label}), {spec.size[0]}x{spec.size[1]}, {material}")
+    lines.append(
+        "Stuff materials: "
+        + "; ".join(f"{cat} = {', '.join(names)}" for cat, names in STUFF_BY_CATEGORY.items())
+        + "."
+    )
+    crops = ", ".join(
+        f"{name} ({label}, fertility {defs.crop_fertility_min.get(name, 0):.1f}+)"
+        for name, label in CROPS.items()
+    )
+    lines.append(f"Crops for growing zones: {crops}.")
+    return lines
+
+
+def describe_placement(decision: Decision, result: object) -> str:
+    """A short record of a successful map action, for later prompts."""
+    if decision.action == "create_growing_zone":
+        return f"{decision.plant} field {decision.rect()} (zone {result})"
+    if decision.action == "create_stockpile":
+        return f"stockpile {decision.rect()} (zone {result})"
+    if decision.action == "place_blueprint":
+        return f"{decision.building_def} blueprint covering {result}"
+    return f"{decision.designation} designation {decision.rect()}"
+
+
 def build_prompt(
     state: GameState,
     colonists: list[Colonist],
@@ -151,6 +289,7 @@ def build_prompt(
     work_tables: list[WorkTable],
     pause_status: str,
     memory: AgentMemory,
+    map_lines: list[str] | None = None,
 ) -> str:
     """Build a prompt for the LLM based on the current game state."""
     lines = [
@@ -177,6 +316,8 @@ def build_prompt(
             [line for table in work_tables for line in describe_work_table(table)]
             or ["None. Build a work table before trying to set a bill."]
         ),
+        "",
+        *(map_lines or []),
         "",
     ]
     return "\n".join(lines) + INSTRUCTIONS + "\n" + memory.to_prompt()
@@ -271,7 +412,7 @@ def run(
 
     # Each action gets the decision and this step's colonists, so work actions
     # can turn the colonist's name into the id RIMAPI needs.
-    actions: dict[str, Callable[[Decision, list[Colonist]], None]] = {
+    actions: dict[str, Callable[[Decision, list[Colonist]], object]] = {
         "wait": lambda d, cols: None,
         "pause": lambda d, cols: client.pause(),
         "resume": lambda d, cols: client.resume(),
@@ -284,7 +425,16 @@ def run(
         "set_bill": lambda d, cols: client.set_target_bill(
             d.building_id, d.recipe_def_name, d.target_count
         ),
+        # Map actions return the zone id or covered cells, for describe_placement.
+        "create_growing_zone": lambda d, cols: client.create_growing_zone(d.plant, d.rect()),
+        "create_stockpile": lambda d, cols: client.create_stockpile(d.rect()),
+        "place_blueprint": lambda d, cols: client.place_blueprint(
+            d.building_def, d.x, d.z, d.rotation, d.stuff
+        ),
+        "designate": lambda d, cols: client.designate(d.designation, d.rect()),
     }
+    map_actions = ("create_growing_zone", "create_stockpile", "place_blueprint", "designate")
+    placements: list[str] = []  # RIMAPI doesn't say where zones are, so remember
     work_types = client.get_work_types()
     if memory is None:
         memory = AgentMemory()
@@ -299,6 +449,14 @@ def run(
                 alerts = client.get_alerts()
                 threats = client.get_threats()
                 work_tables = client.get_work_tables()
+                map_lines = describe_map(
+                    colonists,
+                    client.get_terrain(),
+                    client.get_game_defs(),
+                    client.get_zones(),
+                    placements,
+                    client.get_finished_research(),
+                )
             except (RimApiError, httpx.TimeoutException) as e:
                 print(f"Step {step}: could not read game state: {e}")
                 time.sleep(step_seconds)
@@ -333,6 +491,7 @@ def run(
                 work_tables,
                 pause_status,
                 memory,
+                map_lines,
             )
 
             danger_present = any(threat.active for threat in threats) or any(
@@ -347,12 +506,17 @@ def run(
             )
             error = None
             try:
-                actions[decision.action](decision, colonists)
+                result = actions[decision.action](decision, colonists)
             except (RimApiError, ValueError) as e:
                 # RimApiError: RIMAPI refused (e.g. work the colonist can't do).
-                # ValueError: the model named a colonist who doesn't exist.
+                # ValueError: our own checks refused, e.g. an unknown colonist,
+                # a blocked area, or a building the colony can't build yet.
                 error = str(e)
                 print(f"Step {step}: failed to {decision.action}: {e}")
+
+            if error is None and decision.action in map_actions:
+                placements.append(describe_placement(decision, result))
+                del placements[:-15]  # keep the prompt bounded
 
             if error is None:
                 if decision.action == "pause":
@@ -379,6 +543,17 @@ def run(
                     "building_id": decision.building_id,
                     "recipe_def_name": decision.recipe_def_name,
                     "target_count": decision.target_count,
+                    "rect": (
+                        [decision.x1, decision.z1, decision.x2, decision.z2]
+                        if decision.x1 is not None
+                        else None
+                    ),
+                    "plant": decision.plant,
+                    "designation": decision.designation,
+                    "building_def": decision.building_def,
+                    "position": [decision.x, decision.z] if decision.x is not None else None,
+                    "rotation": decision.rotation,
+                    "stuff": decision.stuff,
                     "reason": decision.reason,
                     "memory_update": (
                         decision.memory_update.model_dump()

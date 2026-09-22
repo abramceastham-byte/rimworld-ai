@@ -7,7 +7,8 @@ The agent loop itself lives elsewhere; this repo provides:
 | File | What it does |
 |------|--------------|
 | `rimagent/config.py` | Reads `OLLAMA_HOST` and `RIMAPI_URL` from the environment / `.env` |
-| `rimagent/rimapi.py` | RIMAPI client for game state, colonists, threats, work settings, work tables, recipes, bills, and game control |
+| `rimagent/rimapi.py` | RIMAPI client for game state, colonists, threats, work settings, work tables, recipes, bills, zones, blueprints, designations, and game control |
+| `rimagent/construction.py` | Map geometry, terrain decoding, and the building/crop catalog the map actions are checked against |
 | `rimagent/fake_model.py` | Fake model returning canned answers, for offline testing |
 | `rimagent/memory.py` | Persistent Markdown observations, structured JSON plans/policies, and recent decision memory |
 | `rimagent/runlog.py` | Writes state snapshots and decisions as JSON lines in `logs/` |
@@ -82,6 +83,37 @@ one production bill using RimWorld's **Do until X** mode:
 The client checks that the recipe is actually available at that table. If the
 same recipe already has a bill, it updates and resumes that bill rather than
 creating a duplicate. Bill deletion is intentionally not exposed to the model.
+
+## Zones, blueprints and designations
+
+The model can shape the map with four actions. Each step's prompt includes
+colonist positions, a terrain mini-map around the colony, existing zones, what
+the agent has placed, and the buildings and crops it may use.
+
+| Action | What it does | Limits |
+|--------|--------------|--------|
+| `create_growing_zone` | Plants one crop in a rectangle | 225 cells; every cell fertile enough for the crop; food/fibre crops only |
+| `create_stockpile` | Storage for all normal items | 225 cells; not on water or marsh |
+| `place_blueprint` | One building for colonists to construct | Catalog buildings only, research finished, valid material |
+| `designate` | Mine rock, harvest ripe plants, or hunt animals in a rectangle | 400 cells |
+
+RIMAPI does little checking of its own here (unknown names are skipped while it
+still reports success, and blueprints skip RimWorld's placement checks), so the
+client checks every request first: it asks RIMAPI what is in the area and
+refuses anything that overlaps rock, buildings or other zones, giving the model
+the reason. Deconstruction, copy/paste and zone deletion are deliberately not
+exposed. RIMAPI has no endpoint for removing a growing zone or a blueprint; use
+the game's own tools for that.
+
+Two RIMAPI quirks the client works around, worth reporting upstream:
+
+- A stockpile created without a priority gets RimWorld's `Unstored` (0), so it
+  stores nothing; RIMAPI also caps the priority at Normal. The client always
+  sends Normal (or Low).
+- Zones in `GET /map/zones` have a size but no location, so the agent keeps its
+  own record of where it placed things during a run.
+
+Tests: `python -m unittest tests/test_map_actions.py -v`
 
 ## Starting a new colony from code
 
