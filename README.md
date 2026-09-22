@@ -148,14 +148,22 @@ python -m scripts.run_agent --model gpt-oss:20b --think medium --steps 20
 python -m scripts.run_agent --model qwen3:14b --think on --steps 20
 ```
 
-**Game time is controlled by the loop.** The game is paused while the model
-decides; after each action it runs for `--run-seconds` (default 10), or
-`--threat-run-seconds` (default 3) while a threat is active, then pauses for the
-next decision. It stops early, so the model can respond at once, if a threat
-letter arrives or the game pauses itself (RimWorld can auto-pause on major
-threats). The model's `pause` action means "stay paused and decide again now";
-every other action lets time run. `--speed` 1-3 sets the game speed while it
-runs. Ctrl+C stops the run and leaves the game paused.
+**Game time is controlled by the loop**, in two modes. The game is always paused
+while the model decides.
+
+- **Running:** after each action the game runs for `--run-seconds` (default 10),
+  or `--threat-run-seconds` (default 3) while a threat is active, then pauses for
+  the next decision. It stops early if a threat letter arrives or the game pauses
+  itself, so the model can respond at once.
+- **Paused:** the model's `pause` action stops time until it chooses `resume`, so
+  it can give several orders in a row (orders are queued and carried out when
+  time runs again). The loop also switches to this mode when the game pauses
+  itself, e.g. RimWorld's auto-pause on a major threat, or you pressing pause.
+
+A run starts in whichever mode matches the game: paused if the game is paused.
+The prompt says which mode is active, why it's paused, how many decisions have
+been made while paused, and what happened while time last ran. `--speed` 1-3 sets
+the game speed while running. Ctrl+C stops the run and leaves the game paused.
 
 **Blueprints the agent places are tracked** in `memory/blueprints.json` and
 checked in the game every step, so the model sees whether each one is waiting,

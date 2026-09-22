@@ -111,11 +111,13 @@ INSTRUCTIONS = (
     "Choose exactly one action: pause, resume, wait, enable_work, disable_work, "
     "set_bill, create_growing_zone, create_stockpile, place_blueprint, designate, "
     "allow_items, chop_trees.\n"
-    "Game time runs between your decisions (see the time note in the state). Every "
-    "action except pause lets time run afterwards; wait does nothing else, and resume "
-    "is the same as wait. pause keeps the game paused so you decide again at once "
-    "with no time passing: use it to handle a threat one step at a time, never to "
-    "wait for work to finish, because nothing progresses while paused.\n"
+    "Pause and resume control time. The game is always paused while you decide; while "
+    "time is running, it runs for a short while after each decision. Choose pause to "
+    "stop time: while paused you can give as many orders as you like, and colonists "
+    "carry them out once you resume. Pausing is also useful when a threat arrives, to "
+    "set up a response step by step. Waiting while paused does nothing: nothing "
+    "changes until you resume, so if you are waiting for something to happen, choose "
+    "resume instead of wait.\n"
     "enable_work / disable_work switch one kind of work on or off for one colonist.\n"
     "set_bill creates or updates one work-table bill in TargetCount mode (the "
     "in-game 'Do until X' setting). It only works on a built work table listed under "
@@ -203,9 +205,52 @@ class TimeWindow:
     ticks: int                     # game ticks that passed
     stopped_by: str | None         # None if it ran the full time, else why it stopped early
     events: list[GameEvent] = field(default_factory=list)  # letters/messages meanwhile
+    game_paused: bool = False      # stopped because the game itself paused (RimWorld or the player)
+    pause_reason: str = ""         # short phrase for the prompt, e.g. "the player paused it"
 
     def to_log(self) -> dict:
-        return {"seconds": self.seconds, "ticks": self.ticks, "stopped_by": self.stopped_by}
+        return {"seconds": self.seconds, "ticks": self.ticks, "stopped_by": self.stopped_by,
+                "game_paused": self.game_paused}
+
+
+@dataclass
+class TimeMode:
+    """Whether the agent keeps game time running between decisions.
+
+    The game is always paused while the model decides. Running: after each
+    decision the loop lets time run for a while. Paused: it doesn't, so the
+    model can give several orders in a row; only resume starts time again.
+    """
+
+    paused: bool
+    reason: str = ""           # why it's paused, for the prompt
+    paused_decisions: int = 0  # decisions made since it was paused
+
+    def to_log(self) -> dict:
+        return {"paused": self.paused, "reason": self.reason,
+                "paused_decisions": self.paused_decisions}
+
+
+def mode_after_decision(mode: TimeMode, action: str) -> TimeMode:
+    """pause and resume switch the mode; any other action keeps it."""
+    if action == "resume":
+        return TimeMode(paused=False)
+    if action == "pause" and not mode.paused:
+        return TimeMode(paused=True, reason="you paused it")
+    if mode.paused:
+        return TimeMode(True, mode.reason, mode.paused_decisions + 1)
+    return mode
+
+
+def mode_after_window(mode: TimeMode, window: TimeWindow) -> TimeMode:
+    """If the game paused itself while time ran, stay paused until the model resumes.
+
+    That's RimWorld's own auto-pause on a major threat, or the player pressing
+    pause; either way the model should look before time runs again.
+    """
+    if window.game_paused:
+        return TimeMode(paused=True, reason=window.pause_reason or "the game paused")
+    return mode
 
 
 def let_time_run(
@@ -224,6 +269,8 @@ def let_time_run(
     start_tick = client.get_state().game_tick
     collected: list[GameEvent] = []
     stopped_by = None
+    game_paused = False
+    pause_reason = ""
     start = time.monotonic()
     client.resume(speed)
     try:
@@ -232,15 +279,23 @@ def let_time_run(
             new = events.drain() if events else []
             collected += new
             threat = next((e for e in new if e.category.startswith("Threat")), None)
-            if threat:
-                stopped_by = f"a threat arrived ({threat.kind}: {threat.text})"
-                break
             try:
                 paused = client.get_state().is_paused
             except (RimApiError, httpx.HTTPError):
-                continue  # a missed check is fine; try again next poll
+                paused = False  # a missed check is fine; try again next poll
+            if threat:
+                # RimWorld may have auto-paused for it at the same moment.
+                game_paused = paused
+                stopped_by = (
+                    f"the game paused itself for a threat ({threat.kind}: {threat.text})"
+                    if paused else f"a threat arrived ({threat.kind}: {threat.text})"
+                )
+                pause_reason = f"RimWorld paused it for a threat: {threat.text}"
+                break
             if paused:
-                stopped_by = "the game was paused by the player or an open menu"
+                game_paused = True
+                stopped_by = "the game was paused (by RimWorld or the player)"
+                pause_reason = "the player paused it"
                 break
     finally:
         client.pause()
@@ -249,28 +304,38 @@ def let_time_run(
         ticks=client.get_state().game_tick - start_tick,
         stopped_by=stopped_by,
         events=collected,
+        game_paused=game_paused,
+        pause_reason=pause_reason,
     )
 
 
 def describe_time(
-    window: TimeWindow | None, held: bool, run_seconds: float, threat_run_seconds: float
+    mode: TimeMode, window: TimeWindow | None, run_seconds: float, threat_run_seconds: float
 ) -> str:
-    """How game time works for the model, and what happened since its last decision."""
-    rule = (
-        "Time only passes between your decisions: the game is paused while you decide, "
-        f"then runs for {run_seconds:g}s ({threat_run_seconds:g}s while a threat is active) "
-        "after your action, then pauses for your next decision. Colonists only move, "
-        "haul, build and cut while it runs."
-    )
-    if held:
-        since = "You chose pause last step, so no game time has passed since."
-    elif window is None:
-        since = "This is the first decision of this session; no time has passed yet."
-    else:
+    """Whether time is running or paused, and what happened since the last decision."""
+    lines = []
+    if window is not None:
         hours = window.ticks / TICKS_PER_HOUR
         since = f"Since your last decision the game ran {window.seconds:g}s ({hours:.1f} in-game hours)"
-        since += f" and stopped early: {window.stopped_by}." if window.stopped_by else "."
-    return f"{rule}\n{since}"
+        lines.append(since + (f" and stopped early: {window.stopped_by}." if window.stopped_by else "."))
+    if mode.paused:
+        count = (f" (Paused for {mode.paused_decisions} decision"
+                 f"{'' if mode.paused_decisions == 1 else 's'}.)" if mode.paused_decisions else "")
+        lines.append(
+            f"The game is paused ({mode.reason}). This is a good time to plan, or to set up a "
+            "response: every order you give now, such as blueprints, zones, work settings, "
+            "bills or chop and harvest marks, is queued for the colonists, and they'll start "
+            "on it all once you resume. "
+            f"Choose resume when you've set up what you want.{count}"
+        )
+    else:
+        lines.append(
+            f"Time is running: after this decision the game runs for {run_seconds:g}s "
+            f"({threat_run_seconds:g}s while a threat is active), then pauses for your next "
+            "decision. If there's a lot to set up, choose pause to stop time and give several "
+            "orders in a row."
+        )
+    return "\n".join(lines)
 
 
 def require_work_table(building_id: int | None, work_tables: list[WorkTable]) -> None:
@@ -579,10 +644,13 @@ def run(
 ) -> None:
     """Run the agent loop for max_steps decisions.
 
-    The loop controls game time: the game is paused while the model decides,
-    then runs for run_seconds after each action (threat_run_seconds while a
-    threat is active), stopping early if a threat arrives or the game pauses
-    itself. Choosing "pause" skips the running time, to decide again at once.
+    The game is always paused while the model decides. In running mode the loop
+    then lets time run for run_seconds (threat_run_seconds while a threat is
+    active), stopping early if a threat arrives or the game pauses itself. The
+    model's pause switches to paused mode: it can give several orders in a row
+    and time stays stopped until it chooses resume. If the game pauses itself
+    (e.g. RimWorld's auto-pause on a major threat), the loop switches to paused
+    mode too. See TimeMode, mode_after_decision and mode_after_window.
     """
     work_tables: list[WorkTable] = []
 
@@ -632,8 +700,13 @@ def run(
         memory = AgentMemory()
     blueprints = BlueprintTracker(memory.memory_dir / "blueprints.json")
     window: TimeWindow | None = None  # what happened while time last ran
-    held = False  # the model chose pause last step
     carried_events: list[GameEvent] = []  # letters/messages that arrived while time ran
+    # Start in the game's own state: if it's paused now, stay paused until the
+    # model resumes (that's the situation the first gpt-oss run got stuck in).
+    if client.get_state().is_paused:
+        mode = TimeMode(paused=True, reason="it was already paused when this session started")
+    else:
+        mode = TimeMode(paused=False)
 
     try:
         for step in range(max_steps):
@@ -670,7 +743,8 @@ def run(
             for event in new_events:
                 logger.log_event(event)
 
-            time_status = describe_time(window, held, run_seconds, threat_run_seconds)
+            time_status = describe_time(mode, window, run_seconds, threat_run_seconds)
+            mode_at_decision = mode
             prompt = build_prompt(
                 state,
                 colonists,
@@ -727,14 +801,16 @@ def run(
             memory.apply_update(step, state.game_tick, decision.memory_update)
             print(f"Step {step}: {decision.action} ({decision.reason})")
 
-            # Let time run, unless the model chose to stay paused.
-            held = decision.action == "pause"
-            if held:
+            # pause/resume switch the mode; in running mode, let time run now.
+            mode = mode_after_decision(mode, decision.action)
+            if mode.paused:
                 window = None
+                print(f"         game stays paused ({mode.reason})")
             else:
                 seconds = threat_run_seconds if danger_present else run_seconds
                 window = let_time_run(client, events, seconds, speed)
                 carried_events = window.events
+                mode = mode_after_window(mode, window)
                 note = f", stopped early: {window.stopped_by}" if window.stopped_by else ""
                 print(f"         game ran {window.seconds:g}s ({window.ticks} ticks){note}")
 
@@ -766,7 +842,8 @@ def run(
                         else None
                     ),
                     "time_status": time_status,
-                    "time_after": window.to_log() if window else "held paused",
+                    "time_mode": mode_at_decision.to_log(),  # as the model saw it
+                    "time_after": window.to_log() if window else "stayed paused",
                     "error": error,
                     # The model's reasoning, for reading later. It is not put
                     # back into the next prompt. None for models without it.

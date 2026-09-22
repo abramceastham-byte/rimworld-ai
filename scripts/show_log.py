@@ -138,8 +138,16 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
     outcome = "FAILED" if error else "ok"
     out = [f"## Step {d.get('step', '?')}: {d['action']} ({outcome})", ""]
     if state:
-        if d.get("time_status"):
-            # The last line says what happened since the previous decision.
+        mode = d.get("time_mode")
+        if mode:
+            if mode.get("paused"):
+                n = mode.get("paused_decisions") or 0
+                game = f"Time paused ({mode.get('reason')}), {n} decision{'' if n == 1 else 's'} so far"
+            else:
+                game = "Time running"
+            since = [line for line in d.get("time_status", "").splitlines() if line.startswith("Since")]
+            game = " ".join([*since, game + "."])
+        elif d.get("time_status"):  # loop-controlled time, before pause/resume modes
             game = d["time_status"].splitlines()[-1]
         else:  # logs from before the loop controlled time
             game = d.get("pause_status") or ("paused" if state.get("is_paused") else "running")
@@ -159,7 +167,7 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
         ran = f"**Then:** the game ran {after.get('seconds')}s ({after.get('ticks')} ticks)"
         out += [ran + (f", stopped early: {after['stopped_by']}" if after.get("stopped_by") else ""), ""]
     elif after:
-        out += [f"**Then:** {after} (no time passed)", ""]
+        out += [f"**Then:** {after}, no time passed", ""]
     out += describe_memory(d.get("memory_update"))
     for f in failures:
         out.append(f"**Attempt {f.get('attempt')} rejected** ({f.get('failure_type')}): `{f.get('error')}`")

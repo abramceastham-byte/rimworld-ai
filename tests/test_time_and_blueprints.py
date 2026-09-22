@@ -8,7 +8,15 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from rimagent.agent import TimeWindow, describe_time, let_time_run, require_work_table
+from rimagent.agent import (
+    TimeMode,
+    TimeWindow,
+    describe_time,
+    let_time_run,
+    mode_after_decision,
+    mode_after_window,
+    require_work_table,
+)
 from rimagent.blueprints import BlueprintTracker, status_from_things
 from rimagent.construction import Rect
 from rimagent.events import GameEvent
@@ -70,28 +78,76 @@ class LetTimeRunTests(unittest.TestCase):
         self.assertIn("Raid", window.stopped_by)
         self.assertLess(window.seconds, 1)
         self.assertEqual([e.text for e in window.events], ["Trader", "Raid"])  # kept for the prompt
+        self.assertFalse(window.game_paused)  # RimWorld didn't pause for it: time keeps running
         self.assertTrue(game.paused)
+
+    def test_a_threat_the_game_paused_for(self) -> None:
+        game = FakeGame(pause_itself_after_checks=3)  # auto-pauses as the letter arrives
+        events = FakeEvents([[], [], [letter("ThreatBig", "Raid")]])
+        window = let_time_run(game, events, seconds=5, poll_seconds=0.02)
+        self.assertTrue(window.game_paused)
+        self.assertIn("paused itself for a threat (letter: Raid)", window.stopped_by)
 
     def test_the_game_pausing_itself_stops_it_early(self) -> None:
         game = FakeGame(pause_itself_after_checks=3)
         window = let_time_run(game, FakeEvents([]), seconds=5, poll_seconds=0.02)
-        self.assertIn("paused by the player", window.stopped_by)
+        self.assertTrue(window.game_paused)
+        self.assertIn("by RimWorld or the player", window.stopped_by)
         self.assertLess(window.seconds, 1)
 
 
+class TimeModeTests(unittest.TestCase):
+    def test_pause_and_resume_switch_the_mode(self) -> None:
+        running = TimeMode(paused=False)
+        paused = mode_after_decision(running, "pause")
+        self.assertEqual((paused.paused, paused.reason, paused.paused_decisions),
+                         (True, "you paused it", 0))
+        self.assertFalse(mode_after_decision(paused, "resume").paused)
+
+    def test_orders_while_paused_keep_it_paused_and_are_counted(self) -> None:
+        mode = TimeMode(paused=True, reason="you paused it")
+        for action in ("place_blueprint", "chop_trees", "wait", "pause"):
+            mode = mode_after_decision(mode, action)
+        self.assertTrue(mode.paused)
+        self.assertEqual(mode.paused_decisions, 4)
+        self.assertEqual(mode.reason, "you paused it")
+
+    def test_orders_while_running_keep_it_running(self) -> None:
+        self.assertFalse(mode_after_decision(TimeMode(paused=False), "place_blueprint").paused)
+        self.assertFalse(mode_after_decision(TimeMode(paused=False), "resume").paused)
+
+    def test_the_game_pausing_itself_switches_to_paused(self) -> None:
+        window = TimeWindow(2.0, 100, "the game paused itself for a threat (letter: Raid)",
+                            game_paused=True, pause_reason="RimWorld paused it for a threat: Raid")
+        mode = mode_after_window(TimeMode(paused=False), window)
+        self.assertTrue(mode.paused)
+        self.assertIn("Raid", mode.reason)
+
+    def test_a_threat_without_a_game_pause_keeps_running(self) -> None:
+        window = TimeWindow(2.0, 100, "a threat arrived (letter: Raid)", game_paused=False)
+        self.assertFalse(mode_after_window(TimeMode(paused=False), window).paused)
+
+
 class DescribeTimeTests(unittest.TestCase):
-    def test_explains_the_rule_every_time(self) -> None:
-        text = describe_time(None, False, 10, 3)
-        self.assertIn("paused while you decide", text)
+    def test_running(self) -> None:
+        text = describe_time(TimeMode(paused=False), None, 10, 3)
+        self.assertIn("Time is running", text)
         self.assertIn("runs for 10s (3s while a threat is active)", text)
-        self.assertIn("first decision", text)
+        self.assertIn("choose pause to stop time", text)
 
-    def test_after_holding_paused(self) -> None:
-        self.assertIn("no game time has passed", describe_time(None, True, 10, 3))
+    def test_paused_invites_planning(self) -> None:
+        text = describe_time(TimeMode(True, "you paused it", 0), None, 10, 3)
+        self.assertIn("The game is paused (you paused it). This is a good time to plan", text)
+        self.assertIn("start on it all once you resume", text)
+        self.assertNotIn("Paused for", text)  # no count on the first paused decision
 
-    def test_after_time_ran(self) -> None:
+    def test_paused_count(self) -> None:
+        self.assertIn("(Paused for 1 decision.)", describe_time(TimeMode(True, "x", 1), None, 10, 3))
+        self.assertIn("(Paused for 6 decisions.)", describe_time(TimeMode(True, "x", 6), None, 10, 3))
+
+    def test_says_what_happened_while_time_ran(self) -> None:
         window = TimeWindow(seconds=2.1, ticks=1250, stopped_by="a threat arrived (letter: Raid)")
-        text = describe_time(window, False, 10, 3)
+        text = describe_time(TimeMode(paused=False), window, 10, 3)
         self.assertIn("ran 2.1s (0.5 in-game hours) and stopped early: a threat arrived", text)
 
 
