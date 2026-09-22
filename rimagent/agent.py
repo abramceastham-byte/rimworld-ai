@@ -8,7 +8,14 @@ import httpx
 from pydantic import BaseModel, ValidationError, model_validator
 
 from rimagent.events import EventListener, GameEvent
-from rimagent.rimapi import Alert, Colonist, GameState, RimApiClient, RimApiError, Threat
+from rimagent.rimapi import (
+    Alert,
+    Colonist,
+    GameState,
+    RimApiClient,
+    RimApiError,
+    Threat,
+)
 from rimagent.runlog import RunLogger
 
 
@@ -17,14 +24,16 @@ class Decision(BaseModel):
 
     action: Literal["pause", "resume", "wait", "enable_work", "disable_work"]
     reason: str = ""
-    colonist: str | None = None   # a colonist's name, for enable_work / disable_work
+    colonist: str | None = None  # a colonist's name, for enable_work / disable_work
     work_type: str | None = None  # e.g. "Cooking", for enable_work / disable_work
 
     @model_validator(mode="after")
     def work_actions_need_a_target(self) -> "Decision":
         # Runs after the fields are checked. Raising here makes parsing fail,
         # so parse_decision turns an incomplete work action into "wait".
-        if self.action in ("enable_work", "disable_work") and not (self.colonist and self.work_type):
+        if self.action in ("enable_work", "disable_work") and not (
+            self.colonist and self.work_type
+        ):
             raise ValueError(f"{self.action} needs both colonist and work_type")
         return self
 
@@ -42,7 +51,9 @@ INSTRUCTIONS = (
 def describe_colonist(c: Colonist) -> str:
     """One line per colonist: needs, what they're doing, best skills, enabled work."""
     passion = {0: "", 1: " (interested)", 2: " (burning)"}
-    best = sorted((s for s in c.skills if not s.totally_disabled), key=lambda s: -s.level)[:3]
+    best = sorted(
+        (s for s in c.skills if not s.totally_disabled), key=lambda s: -s.level
+    )[:3]
     skills = ", ".join(f"{s.name} {s.level}{passion.get(s.passion, '')}" for s in best)
     work = ", ".join(w.work_type for w in c.work_priorities) or "nothing"
     return (
@@ -52,6 +63,21 @@ def describe_colonist(c: Colonist) -> str:
     )
 
 
+def describe_pause(
+    is_paused: bool, paused_by_agent: bool | None, threat_letter: GameEvent | None
+) -> str:
+    """Explain to the model whether the game is paused, and why."""
+    if not is_paused:
+        return "Game is running."
+    if paused_by_agent is None:
+        return "Game is paused (it was already paused when you started)."
+    if paused_by_agent:
+        return "Game is paused: you paused it."
+    if threat_letter:
+        return f"Game is paused: the game paused itself because of a major threat ({threat_letter.text})."
+    return "Game is paused by the player or an open menu."
+
+
 def build_prompt(
     state: GameState,
     colonists: list[Colonist],
@@ -59,12 +85,12 @@ def build_prompt(
     threats: list[Threat],
     events: list[GameEvent],
     work_types: list[str],
+    pause_status: str,
 ) -> str:
     """Build a prompt for the LLM based on the current game state."""
     lines = [
         "Current game state:",
-        # TODO 5: say *why* the game is paused (by you, or by the game itself).
-        f"Game is {'paused' if state.is_paused else 'running'}.",
+        pause_status,
         f"Tick {state.game_tick}. {state.colonist_count} colonists.",
         f"Wealth {state.colony_wealth:,.0f}. Storyteller {state.storyteller}.",
         "",
@@ -117,10 +143,16 @@ def run(
         "wait": lambda d, cols: None,
         "pause": lambda d, cols: client.pause(),
         "resume": lambda d, cols: client.resume(),
-        "enable_work": lambda d, cols: client.enable_work(colonist_id(cols, d.colonist), d.work_type),
-        "disable_work": lambda d, cols: client.disable_work(colonist_id(cols, d.colonist), d.work_type),
+        "enable_work": lambda d, cols: client.enable_work(
+            colonist_id(cols, d.colonist), d.work_type
+        ),
+        "disable_work": lambda d, cols: client.disable_work(
+            colonist_id(cols, d.colonist), d.work_type
+        ),
     }
     work_types = client.get_work_types()
+    paused_by_agent: bool | None = None  # unknown until the agent acts
+    last_threat_letter: GameEvent | None = None
 
     try:
         for step in range(max_steps):
@@ -135,10 +167,33 @@ def run(
                 continue
             new_events = events.drain() if events else []
 
+            for event in new_events:
+                if event.category == "ThreatBig":
+                    last_threat_letter = event
+
+            if not state.is_paused:
+                # The game is running, so any earlier pause is over, whoever caused it.
+                paused_by_agent = False
+                last_threat_letter = None
+
             logger.log_state(state)
             for event in new_events:
                 logger.log_event(event)
-            prompt = build_prompt(state, colonists, alerts, threats, new_events, work_types)
+
+            pause_status = describe_pause(
+                state.is_paused,
+                paused_by_agent,
+                last_threat_letter,
+            )
+            prompt = build_prompt(
+                state,
+                colonists,
+                alerts,
+                threats,
+                new_events,
+                work_types,
+                pause_status,
+            )
 
             reply = model(prompt)
             decision = parse_decision(reply)
@@ -150,6 +205,13 @@ def run(
                 # ValueError: the model named a colonist who doesn't exist.
                 error = str(e)
                 print(f"Step {step}: failed to {decision.action}: {e}")
+
+            if error is None:
+                if decision.action == "pause":
+                    paused_by_agent = True
+                elif decision.action == "resume":
+                    paused_by_agent = False
+
             logger.log_decision(
                 {
                     "step": step,
@@ -158,6 +220,7 @@ def run(
                     "colonist": decision.colonist,
                     "work_type": decision.work_type,
                     "reason": decision.reason,
+                    "pause_status": pause_status,
                     "error": error,
                 }
             )
