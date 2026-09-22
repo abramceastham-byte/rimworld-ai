@@ -687,6 +687,17 @@ class RimApiClient:
             if is_tree(p.get("def_name", ""))
         ]
 
+    def get_things_at(self, x: int, z: int, map_id: int = 0) -> list[MapThing]:
+        """Everything on one cell, including blueprints (Blueprint_<def>) and
+        buildings under construction (Frame_<def>), which no list endpoint shows."""
+        # RIMAPI reads this GET request's parameters from a JSON body.
+        data = self._request(
+            "GET",
+            "/api/v1/map/things-at",
+            json={"map_id": map_id, "position": {"x": x, "y": 0, "z": z}},
+        )
+        return [MapThing.model_validate(t) for t in data or []]
+
     def allow_items(self, rect: Rect, map_id: int = 0) -> int:
         """Unforbid every forbidden item in a rectangle so colonists can use it.
 

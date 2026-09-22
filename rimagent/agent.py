@@ -3,11 +3,13 @@
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from rimagent.blueprints import BlueprintTracker, Status, TrackedBlueprint
 from rimagent.construction import (
     CROPS,
     MAX_CHOP_TREES,
@@ -22,6 +24,7 @@ from rimagent.construction import (
 from rimagent.events import EventListener, GameEvent
 from rimagent.memory import AgentMemory, MemoryUpdate
 from rimagent.rimapi import (
+    NORMAL,
     Alert,
     Colonist,
     GameDefs,
@@ -108,11 +111,18 @@ INSTRUCTIONS = (
     "Choose exactly one action: pause, resume, wait, enable_work, disable_work, "
     "set_bill, create_growing_zone, create_stockpile, place_blueprint, designate, "
     "allow_items, chop_trees.\n"
+    "Game time runs between your decisions (see the time note in the state). Every "
+    "action except pause lets time run afterwards; wait does nothing else, and resume "
+    "is the same as wait. pause keeps the game paused so you decide again at once "
+    "with no time passing: use it to handle a threat one step at a time, never to "
+    "wait for work to finish, because nothing progresses while paused.\n"
     "enable_work / disable_work switch one kind of work on or off for one colonist.\n"
     "set_bill creates or updates one work-table bill in TargetCount mode (the "
-    "in-game 'Do until X' setting). Use an exact work-table id and recipe def name "
-    "from the current state. Prefer updating an existing useful bill instead of "
-    "creating competing food recipes. target_count must be between 1 and 500.\n"
+    "in-game 'Do until X' setting). It only works on a built work table listed under "
+    "'Work tables and production bills', using that listed id and one of its recipe "
+    "def names. Blueprints and buildings under construction are not work tables yet: "
+    "never guess an id. Prefer updating an existing useful bill instead of creating "
+    "competing food recipes. target_count must be between 1 and 500.\n"
     "Map actions use cell coordinates from the Map section: x grows east, z grows north.\n"
     f"create_growing_zone plants one crop in the rectangle x1,z1 to x2,z2 (at most "
     f"{MAX_ZONE_CELLS} cells; every cell needs fertile soil). create_stockpile makes a "
@@ -121,7 +131,9 @@ INSTRUCTIONS = (
     "or hunt (wild animals; dangerous ones can fight back).\n"
     "place_blueprint places one building from the buildable list at x,z, with rotation "
     "0 north, 1 east, 2 south or 3 west, and a stuff material if the building lists "
-    "any. Colonists then build it if they have Construction enabled and materials.\n"
+    "any. Colonists then build it while time runs, if one has Construction enabled "
+    "and the materials are allowed and reachable. Check 'Your blueprints' before "
+    "placing more, and don't place a second building on a planned spot.\n"
     f"allow_items unforbids every forbidden item in a rectangle (at most "
     f"{MAX_DESIGNATE_CELLS} cells) so colonists can haul and use it; forbidden items "
     "are marked f on the map. chop_trees marks the trees (T on the map) in a rectangle "
@@ -180,19 +192,95 @@ def describe_colonist(c: Colonist) -> str:
     )
 
 
-def describe_pause(
-    is_paused: bool, paused_by_agent: bool | None, threat_letter: GameEvent | None
+TICKS_PER_HOUR = 2500  # RimWorld: 60,000 ticks per in-game day
+
+
+@dataclass
+class TimeWindow:
+    """What happened while the loop let the game run after a decision."""
+
+    seconds: float                 # real seconds the game ran
+    ticks: int                     # game ticks that passed
+    stopped_by: str | None         # None if it ran the full time, else why it stopped early
+    events: list[GameEvent] = field(default_factory=list)  # letters/messages meanwhile
+
+    def to_log(self) -> dict:
+        return {"seconds": self.seconds, "ticks": self.ticks, "stopped_by": self.stopped_by}
+
+
+def let_time_run(
+    client: RimApiClient,
+    events: EventListener | None,
+    seconds: float,
+    speed: int = NORMAL,
+    poll_seconds: float = 1.0,
+) -> TimeWindow:
+    """Unpause for up to `seconds`, then pause again.
+
+    Stops early, so the model can respond straight away, when a threat letter
+    arrives or when the game pauses itself (RimWorld can auto-pause on major
+    threats) or is paused by the player.
+    """
+    start_tick = client.get_state().game_tick
+    collected: list[GameEvent] = []
+    stopped_by = None
+    start = time.monotonic()
+    client.resume(speed)
+    try:
+        while (elapsed := time.monotonic() - start) < seconds:
+            time.sleep(min(poll_seconds, seconds - elapsed))
+            new = events.drain() if events else []
+            collected += new
+            threat = next((e for e in new if e.category.startswith("Threat")), None)
+            if threat:
+                stopped_by = f"a threat arrived ({threat.kind}: {threat.text})"
+                break
+            try:
+                paused = client.get_state().is_paused
+            except (RimApiError, httpx.HTTPError):
+                continue  # a missed check is fine; try again next poll
+            if paused:
+                stopped_by = "the game was paused by the player or an open menu"
+                break
+    finally:
+        client.pause()
+    return TimeWindow(
+        seconds=round(time.monotonic() - start, 1),
+        ticks=client.get_state().game_tick - start_tick,
+        stopped_by=stopped_by,
+        events=collected,
+    )
+
+
+def describe_time(
+    window: TimeWindow | None, held: bool, run_seconds: float, threat_run_seconds: float
 ) -> str:
-    """Explain to the model whether the game is paused, and why."""
-    if not is_paused:
-        return "Game is running."
-    if paused_by_agent is None:
-        return "Game is paused (it was already paused when you started)."
-    if paused_by_agent:
-        return "Game is paused: you paused it."
-    if threat_letter:
-        return f"Game is paused: the game paused itself because of a major threat ({threat_letter.text})."
-    return "Game is paused by the player or an open menu."
+    """How game time works for the model, and what happened since its last decision."""
+    rule = (
+        "Time only passes between your decisions: the game is paused while you decide, "
+        f"then runs for {run_seconds:g}s ({threat_run_seconds:g}s while a threat is active) "
+        "after your action, then pauses for your next decision. Colonists only move, "
+        "haul, build and cut while it runs."
+    )
+    if held:
+        since = "You chose pause last step, so no game time has passed since."
+    elif window is None:
+        since = "This is the first decision of this session; no time has passed yet."
+    else:
+        hours = window.ticks / TICKS_PER_HOUR
+        since = f"Since your last decision the game ran {window.seconds:g}s ({hours:.1f} in-game hours)"
+        since += f" and stopped early: {window.stopped_by}." if window.stopped_by else "."
+    return f"{rule}\n{since}"
+
+
+def require_work_table(building_id: int | None, work_tables: list[WorkTable]) -> None:
+    """Refuse bills on anything but a built work table, before asking RIMAPI."""
+    if building_id not in {t.id for t in work_tables}:
+        listed = ", ".join(f"{t.id} ({t.label})" for t in work_tables) or "none yet"
+        raise ValueError(
+            f"{building_id} is not a built work table. Work tables now: {listed}. "
+            "Blueprints and buildings under construction can't take bills until built."
+        )
 
 
 def describe_work_table(table: WorkTable) -> list[str]:
@@ -245,9 +333,11 @@ def describe_map(
     finished_research: set[str],
     items: list[MapThing] | None = None,
     trees: list[MapThing] | None = None,
+    blueprints: list[tuple[TrackedBlueprint, Status]] | None = None,
 ) -> list[str]:
     """Everything the model needs to pick coordinates without inventing them."""
     forbidden = [i for i in items or [] if i.is_forbidden]
+    blueprint_marks = {"waiting": "b", "under construction": "F", "built": "B"}
     lines = [f"Map: {terrain.width} x {terrain.height} cells. x grows east, z grows north."]
     for c in colonists:
         if c.position:
@@ -265,6 +355,10 @@ def describe_map(
             marks[(t.position.x, t.position.z)] = "T"
         for i in forbidden:
             marks[(i.position.x, i.position.z)] = "f"
+        for bp, status in blueprints or []:
+            if status in blueprint_marks:
+                for cell in bp.area():
+                    marks[cell] = blueprint_marks[status]
         for c in colonists:
             if c.position:
                 marks[(c.position.x, c.position.z)] = "@"
@@ -273,6 +367,7 @@ def describe_map(
             f"Map around the colony, x {x1}-{x2} left to right, z {z2} (top) down to {z1}:",
             "  R rich soil  . soil (any crop)  , poor soil  _ stone/floor, nothing grows",
             "  ~ water/marsh (no heavy building)  @ colonist  T tree  f forbidden item",
+            "  b your blueprint (not started)  F under construction  B just finished",
             "  Rock and allowed items are not shown; blocked spots are rejected with a reason.",
         ]
         for z in range(z2, z1 - 1, -1):
@@ -305,6 +400,17 @@ def describe_map(
 
     lines += ["", "Zones: " + (", ".join(f"{z.label} ({z.type}, {z.cells_count} cells)" for z in zones) or "none") + "."]
     lines.append("Placed by you: " + ("; ".join(placements) or "nothing yet") + ".")
+    if blueprints:
+        lines.append("Your blueprints, checked in the game just now:")
+        notes = {
+            "waiting": "waiting to be built (needs a colonist with Construction and the materials)",
+            "under construction": "under construction",
+            "built": "built",
+            "gone": "gone (cancelled or destroyed)",
+        }
+        lines += [f"- {bp.label()}, covering {bp.area()}: {notes[status]}" for bp, status in blueprints]
+    else:
+        lines.append("Your blueprints: none.")
 
     buildable = available_buildings(finished_research)
     lines += ["", "Buildable (def name, size facing north, material types):"]
@@ -347,14 +453,14 @@ def build_prompt(
     events: list[GameEvent],
     work_types: list[str],
     work_tables: list[WorkTable],
-    pause_status: str,
+    time_status: str,
     memory: AgentMemory,
     map_lines: list[str] | None = None,
 ) -> str:
     """Build a prompt for the LLM based on the current game state."""
     lines = [
         "Current game state:",
-        pause_status,
+        time_status,
         f"Tick {state.game_tick}. {state.colonist_count} colonists.",
         f"Wealth {state.colony_wealth:,.0f}. Storyteller {state.storyteller}.",
         "",
@@ -466,26 +572,39 @@ def run(
     logger: RunLogger,
     events: EventListener | None = None,
     max_steps: int = 10,
-    step_seconds: float = 5.0,
+    run_seconds: float = 10.0,
+    threat_run_seconds: float = 3.0,
+    speed: int = NORMAL,
     memory: AgentMemory | None = None,
 ) -> None:
-    """Run the agent loop for max_steps steps."""
+    """Run the agent loop for max_steps decisions.
+
+    The loop controls game time: the game is paused while the model decides,
+    then runs for run_seconds after each action (threat_run_seconds while a
+    threat is active), stopping early if a threat arrives or the game pauses
+    itself. Choosing "pause" skips the running time, to decide again at once.
+    """
+    work_tables: list[WorkTable] = []
+
+    def set_bill(d: Decision, cols: list[Colonist]) -> None:
+        # work_tables is this step's list (read below, before any action runs).
+        require_work_table(d.building_id, work_tables)
+        client.set_target_bill(d.building_id, d.recipe_def_name, d.target_count)
 
     # Each action gets the decision and this step's colonists, so work actions
-    # can turn the colonist's name into the id RIMAPI needs.
+    # can turn the colonist's name into the id RIMAPI needs. pause and resume do
+    # nothing here: the loop decides whether time runs after each step.
     actions: dict[str, Callable[[Decision, list[Colonist]], object]] = {
         "wait": lambda d, cols: None,
-        "pause": lambda d, cols: client.pause(),
-        "resume": lambda d, cols: client.resume(),
+        "pause": lambda d, cols: None,
+        "resume": lambda d, cols: None,
         "enable_work": lambda d, cols: client.enable_work(
             colonist_id(cols, d.colonist), d.work_type
         ),
         "disable_work": lambda d, cols: client.disable_work(
             colonist_id(cols, d.colonist), d.work_type
         ),
-        "set_bill": lambda d, cols: client.set_target_bill(
-            d.building_id, d.recipe_def_name, d.target_count
-        ),
+        "set_bill": set_bill,
         # Map actions return the zone id or covered cells, for describe_placement.
         "create_growing_zone": lambda d, cols: client.create_growing_zone(d.plant, d.rect()),
         "create_stockpile": lambda d, cols: client.create_stockpile(d.rect()),
@@ -496,10 +615,10 @@ def run(
         "allow_items": lambda d, cols: client.allow_items(d.rect()),
         "chop_trees": lambda d, cols: client.chop_trees(d.rect()),
     }
+    # Blueprints are tracked separately (see BlueprintTracker), with live status.
     map_actions = (
         "create_growing_zone",
         "create_stockpile",
-        "place_blueprint",
         "designate",
         "allow_items",
         "chop_trees",
@@ -511,12 +630,15 @@ def run(
     work_types = client.get_work_types()
     if memory is None:
         memory = AgentMemory()
-    paused_by_agent: bool | None = None  # unknown until the agent acts
-    last_threat_letter: GameEvent | None = None
+    blueprints = BlueprintTracker(memory.memory_dir / "blueprints.json")
+    window: TimeWindow | None = None  # what happened while time last ran
+    held = False  # the model chose pause last step
+    carried_events: list[GameEvent] = []  # letters/messages that arrived while time ran
 
     try:
         for step in range(max_steps):
             try:
+                client.pause()  # the model always decides on a paused game
                 state = client.get_state()
                 colonists = client.get_colonists()
                 alerts = client.get_alerts()
@@ -525,6 +647,7 @@ def run(
                 if trees_read_at is None or step - trees_read_at >= TREE_REFRESH_STEPS:
                     trees = client.get_trees()
                     trees_read_at = step
+                blueprint_report = blueprints.check(client)
                 map_lines = describe_map(
                     colonists,
                     client.get_terrain(),
@@ -534,31 +657,20 @@ def run(
                     client.get_finished_research(),
                     client.get_items(),
                     trees,
+                    blueprint_report,
                 )
             except (RimApiError, httpx.TimeoutException) as e:
                 print(f"Step {step}: could not read game state: {e}")
-                time.sleep(step_seconds)
+                time.sleep(2)
                 continue
-            new_events = events.drain() if events else []
-
-            for event in new_events:
-                if event.category == "ThreatBig":
-                    last_threat_letter = event
-
-            if not state.is_paused:
-                # The game is running, so any earlier pause is over, whoever caused it.
-                paused_by_agent = False
-                last_threat_letter = None
+            new_events = carried_events + (events.drain() if events else [])
+            carried_events = []
 
             logger.log_state(state)
             for event in new_events:
                 logger.log_event(event)
 
-            pause_status = describe_pause(
-                state.is_paused,
-                paused_by_agent,
-                last_threat_letter,
-            )
+            time_status = describe_time(window, held, run_seconds, threat_run_seconds)
             prompt = build_prompt(
                 state,
                 colonists,
@@ -567,7 +679,7 @@ def run(
                 new_events,
                 work_types,
                 work_tables,
-                pause_status,
+                time_status,
                 memory,
                 map_lines,
             )
@@ -588,21 +700,21 @@ def run(
             except (RimApiError, ValueError) as e:
                 # RimApiError: RIMAPI refused (e.g. work the colonist can't do).
                 # ValueError: our own checks refused, e.g. an unknown colonist,
-                # a blocked area, or a building the colony can't build yet.
+                # a blocked area, a building the colony can't build yet, or a
+                # bill on something that isn't a built work table.
                 error = str(e)
                 print(f"Step {step}: failed to {decision.action}: {e}")
 
-            if error is None and decision.action in map_actions:
+            if error is None and decision.action == "place_blueprint":
+                blueprints.add(
+                    decision.building_def, decision.stuff, decision.x, decision.z,
+                    decision.rotation, result,
+                )
+            elif error is None and decision.action in map_actions:
                 placements.append(describe_placement(decision, result))
                 del placements[:-15]  # keep the prompt bounded
             if decision.action == "chop_trees":
                 trees_read_at = None  # re-read next step so cut trees update
-
-            if error is None:
-                if decision.action == "pause":
-                    paused_by_agent = True
-                elif decision.action == "resume":
-                    paused_by_agent = False
 
             memory.remember_decision(
                 step,
@@ -613,6 +725,19 @@ def run(
                 decision.work_type,
             )
             memory.apply_update(step, state.game_tick, decision.memory_update)
+            print(f"Step {step}: {decision.action} ({decision.reason})")
+
+            # Let time run, unless the model chose to stay paused.
+            held = decision.action == "pause"
+            if held:
+                window = None
+            else:
+                seconds = threat_run_seconds if danger_present else run_seconds
+                window = let_time_run(client, events, seconds, speed)
+                carried_events = window.events
+                note = f", stopped early: {window.stopped_by}" if window.stopped_by else ""
+                print(f"         game ran {window.seconds:g}s ({window.ticks} ticks){note}")
+
             logger.log_decision(
                 {
                     "step": step,
@@ -640,7 +765,8 @@ def run(
                         if decision.memory_update
                         else None
                     ),
-                    "pause_status": pause_status,
+                    "time_status": time_status,
+                    "time_after": window.to_log() if window else "held paused",
                     "error": error,
                     # The model's reasoning, for reading later. It is not put
                     # back into the next prompt. None for models without it.
@@ -648,8 +774,6 @@ def run(
                     "model_stats": getattr(model, "last_stats", None),
                 }
             )
-            print(f"Step {step}: {decision.action} ({decision.reason})")
-            time.sleep(step_seconds)
     finally:
         # Runs even on Ctrl+C or a crash: don't leave the colony unattended.
         try:

@@ -144,9 +144,23 @@ With Ollama reachable at `OLLAMA_HOST` (see the SSH tunnel section below):
 python -m scripts.dry_run qwen3:14b --think on
 
 # A real run: the model plays for 20 steps.
-python -m scripts.run_agent --model qwen3:14b --think off --steps 20
-python -m scripts.run_agent --model gpt-oss:20b --think low --steps 20
+python -m scripts.run_agent --model gpt-oss:20b --think medium --steps 20
+python -m scripts.run_agent --model qwen3:14b --think on --steps 20
 ```
+
+**Game time is controlled by the loop.** The game is paused while the model
+decides; after each action it runs for `--run-seconds` (default 10), or
+`--threat-run-seconds` (default 3) while a threat is active, then pauses for the
+next decision. It stops early, so the model can respond at once, if a threat
+letter arrives or the game pauses itself (RimWorld can auto-pause on major
+threats). The model's `pause` action means "stay paused and decide again now";
+every other action lets time run. `--speed` 1-3 sets the game speed while it
+runs. Ctrl+C stops the run and leaves the game paused.
+
+**Blueprints the agent places are tracked** in `memory/blueprints.json` and
+checked in the game every step, so the model sees whether each one is waiting,
+under construction, built, or gone (RIMAPI has no endpoint that lists
+blueprints, so ones placed by hand aren't tracked).
 
 `--think` is `on`/`off` for qwen3 and `low`/`medium`/`high` for gpt-oss (which
 can't switch it off).

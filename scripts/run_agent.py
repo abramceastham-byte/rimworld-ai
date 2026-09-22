@@ -4,11 +4,17 @@ RimWorld must be running with a colony loaded. For a real model, Ollama must be
 reachable at OLLAMA_HOST (e.g. through the SSH tunnel in the README).
 
     python -m scripts.run_agent                                   # fake model, 3 steps
-    python -m scripts.run_agent --model qwen3:14b --think off --steps 20
-    python -m scripts.run_agent --model gpt-oss:20b --think low --steps 20
+    python -m scripts.run_agent --model qwen3:14b --think on --steps 20
+    python -m scripts.run_agent --model gpt-oss:20b --think medium --steps 20
+
+The loop controls game time: paused while the model decides, then running for
+--run-seconds after each action (--threat-run-seconds while a threat is active).
+Press Ctrl+C to stop; the game is left paused.
 """
 
 import argparse
+
+import httpx
 
 from rimagent.agent import Decision, run
 from rimagent.events import EventListener
@@ -23,7 +29,12 @@ def main() -> None:
     parser.add_argument("--model", help="Ollama model name, e.g. qwen3:14b. Omit to use the fake model.")
     parser.add_argument("--think", help="on/off (qwen3) or low/medium/high (gpt-oss). Default: the model's own.")
     parser.add_argument("--steps", type=int, help="Decisions to make (default: 3 fake, 10 real).")
-    parser.add_argument("--step-seconds", type=float, default=5.0, help="Pause between steps.")
+    parser.add_argument("--run-seconds", type=float, default=10.0,
+                        help="How long the game runs after each decision (default 10).")
+    parser.add_argument("--threat-run-seconds", type=float, default=3.0,
+                        help="How long it runs while a threat is active (default 3).")
+    parser.add_argument("--speed", type=int, choices=(1, 2, 3), default=1,
+                        help="Game speed while running: 1 normal, 2 fast, 3 superfast.")
     parser.add_argument("--num-ctx", type=int, default=16384, help="Model context window in tokens.")
     parser.add_argument("--no-schema", action="store_true",
                         help="Don't force the reply to match Decision's JSON schema.")
@@ -43,11 +54,31 @@ def main() -> None:
         info, label = {"model": "fake"}, "fake"
         steps = args.steps or 3
 
-    logger = RunLogger(label=label)
-    logger.log_run_info({**info, "steps": steps, "step_seconds": args.step_seconds})
-    print(f"Running {info['model']} for {steps} steps. Log: {logger.path}")
-    with RimApiClient() as client, EventListener() as events:
-        run(client, model, logger, events, max_steps=steps, step_seconds=args.step_seconds)
+    with RimApiClient() as client:
+        try:
+            client.get_state()  # fail fast, before creating an empty log
+        except httpx.ConnectError:
+            print("Can't reach RIMAPI. Is RimWorld running with the mod enabled and a colony "
+                  "loaded? (Check RIMAPI_URL in .env.)")
+            return
+
+        logger = RunLogger(label=label)
+        logger.log_run_info({
+            **info, "steps": steps, "run_seconds": args.run_seconds,
+            "threat_run_seconds": args.threat_run_seconds, "speed": args.speed,
+        })
+        print(f"Running {info['model']} for {steps} steps. Log: {logger.path}")
+        try:
+            with EventListener() as events:
+                run(
+                    client, model, logger, events, max_steps=steps,
+                    run_seconds=args.run_seconds, threat_run_seconds=args.threat_run_seconds,
+                    speed=args.speed,
+                )
+        except KeyboardInterrupt:
+            # run() has already paused the game on its way out.
+            print(f"\nStopped by you. The game is paused. Log: {logger.path}")
+            return
     print(f"Log saved to {logger.path}")
 
 

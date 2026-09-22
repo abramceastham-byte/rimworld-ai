@@ -16,7 +16,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from rimagent.agent import Decision, build_prompt, describe_map, describe_pause
+from rimagent.agent import Decision, build_prompt, describe_map, describe_time
+from rimagent.blueprints import BlueprintTracker
 from rimagent.memory import AgentMemory
 from rimagent.ollama_model import OllamaModel, parse_think
 from rimagent.rimapi import RimApiClient
@@ -26,13 +27,16 @@ from rimagent.runlog import stamped_name
 def live_prompt(client: RimApiClient) -> str:
     """The prompt a real step would build right now (as in agent.run's first step)."""
     state, colonists = client.get_state(), client.get_colonists()
+    memory = AgentMemory()
+    blueprints = BlueprintTracker(memory.memory_dir / "blueprints.json")
     map_lines = describe_map(
         colonists, client.get_terrain(), client.get_game_defs(), client.get_zones(), [],
         client.get_finished_research(), client.get_items(), client.get_trees(),
+        blueprints.check(client, forget_finished=False),
     )
     return build_prompt(
         state, colonists, client.get_alerts(), client.get_threats(), [], client.get_work_types(),
-        client.get_work_tables(), describe_pause(state.is_paused, None, None), AgentMemory(),
+        client.get_work_tables(), describe_time(None, False, 10, 3), memory,
         map_lines,
     )
 
