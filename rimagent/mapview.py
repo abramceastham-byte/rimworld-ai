@@ -12,6 +12,7 @@ are already checked to be clear, so it can pick a place instead of doing
 arithmetic on the grid.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from rimagent.construction import Rect, TerrainInfo
@@ -155,12 +156,15 @@ def block_mark(block: Rect, terrain, defs_terrain: dict[str, TerrainInfo],
 
 def free_spots(anchor: tuple[int, int], terrain, defs_terrain: dict[str, TerrainInfo],
                occupied: set[tuple[int, int]], radius: int = 20,
-               wanted: tuple[tuple[int, int], ...] = ((3, 3), (5, 5), (7, 5))) -> list[tuple[str, Rect, str]]:
+               wanted: tuple[tuple[int, int], ...] = ((3, 3), (5, 5), (7, 5)),
+               is_clear: Callable[[Rect], bool] | None = None,
+               max_checks: int = 8) -> list[tuple[str, Rect, str]]:
     """Rectangles near the base with nothing in the way, as lettered options.
 
     Saves the model from picking coordinates off the grid, which is where it
-    goes wrong most often. Rock and items are not visible here, so a spot can
-    still be refused; the reason then says why.
+    goes wrong most often. is_clear, when given, asks the game about each
+    candidate, nearest first (up to max_checks per size): zones whose cells
+    aren't known locally, rock and buildings only show up there.
     """
     cx, cz = anchor
     x1, z1 = max(0, cx - radius), max(0, cz - radius)
@@ -175,7 +179,7 @@ def free_spots(anchor: tuple[int, int], terrain, defs_terrain: dict[str, Terrain
     found: list[tuple[str, Rect, str]] = []
     taken: list[Rect] = []
     for width, depth in wanted:
-        best: tuple[int, Rect, float] | None = None
+        candidates: list[tuple[int, Rect, float]] = []
         for z in range(z1, z2 - depth + 2):
             for x in range(x1, x2 - width + 2):
                 rect = Rect(x, z, x + width - 1, z + depth - 1)
@@ -183,12 +187,20 @@ def free_spots(anchor: tuple[int, int], terrain, defs_terrain: dict[str, Terrain
                 if any(i is None for i in infos) or any(rect.overlaps(t) for t in taken):
                     continue
                 distance = abs(x + width // 2 - cx) + abs(z + depth // 2 - cz)
-                fertility = min(i.fertility for i in infos if i)
-                if best is None or distance < best[0]:
-                    best = (distance, rect, fertility)
-        if best:
-            _, rect, fertility = best
+                candidates.append((distance, rect, min(i.fertility for i in infos if i)))
+        candidates.sort(key=lambda c: c[0])
+        checked: list[Rect] = []  # refused ones, so a neighbour one cell over isn't asked again
+        for _, rect, fertility in candidates:
+            if is_clear is not None:
+                if len(checked) >= max_checks:
+                    break
+                if any(rect.overlaps(r) for r in checked):
+                    continue
+                if not is_clear(rect):
+                    checked.append(rect)
+                    continue
             note = "fertile, crops can grow here" if fertility >= 0.7 else "no crops (poor soil)"
             found.append((chr(ord("A") + len(found)), rect, f"{width}x{depth}, {note}"))
             taken.append(rect)
+            break
     return found

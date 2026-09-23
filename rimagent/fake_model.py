@@ -10,13 +10,8 @@ import json
 from collections.abc import Callable, Iterable
 
 DEFAULT_ANSWERS = [
-    # A reply is a turn: one or more actions, carried out in order.
-    json.dumps({"actions": [{"action": "pause", "reason": "Take stock of the colony."}]}),
-    json.dumps({"actions": [
-        {"action": "wait", "reason": "Nothing to set up while paused."},
-        {"action": "resume", "reason": "Let the colonists get on with it."},
-    ]}),
-    json.dumps({"actions": [{"action": "wait", "reason": "Watching how things develop."}]}),
+    json.dumps({"actions": [], "time": "hold"}),
+    json.dumps({"actions": [], "time": "advance"}),
 ]
 
 

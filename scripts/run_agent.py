@@ -7,9 +7,9 @@ reachable at OLLAMA_HOST (e.g. through the SSH tunnel in the README).
     python -m scripts.run_agent --model qwen3:14b --think on --steps 20
     python -m scripts.run_agent --model gpt-oss:20b --think medium --steps 20
 
-The loop controls game time: paused while the model decides, then running for
---run-seconds after each action (--threat-run-seconds while a threat is active).
-Press Ctrl+C to stop; the game is left paused.
+The game is paused while the model decides and its orders run. Each turn then
+chooses advance (the game runs --run-seconds, or --threat-run-seconds while a
+threat is active) or hold. Press Ctrl+C to stop; the game is left paused.
 """
 
 import argparse
@@ -38,7 +38,7 @@ def main() -> None:
                         help="Game speed while running: 1 normal, 2 fast, 3 superfast.")
     parser.add_argument("--num-ctx", type=int, default=16384, help="Model context window in tokens.")
     parser.add_argument("--no-schema", action="store_true",
-                        help="Don't force the reply to match the Turn JSON schema.")
+                        help="Don't force the reply to match each turn's JSON schema.")
     args = parser.parse_args()
 
     if args.model:

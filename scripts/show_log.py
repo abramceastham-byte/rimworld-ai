@@ -171,10 +171,12 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
         out += [f"- {e.get('kind')} ({e.get('category')}): {e.get('text')}" for e in events]
         out.append("")
     out += [f"**Reason:** {d.get('reason') or '(none given)'}", ""]
+    if d.get("time"):
+        out += [f"**Time choice:** {d['time']}", ""]
     targets = describe_targets(d)
     if targets:
         out += targets + [""]
-    out += [f"**Result:** {'FAILED: ' + error if error else 'done'}", ""]
+    out += [f"**Result:** {'FAILED: ' + error if error else d.get('result', 'done')}", ""]
     out += describe_memory(d.get("memory_update"))
     for f in failures:
         out.append(f"**Attempt {f.get('attempt')} rejected** ({f.get('failure_type')}): `{f.get('error')}`")
@@ -203,9 +205,15 @@ def dry_run_to_markdown(path: Path) -> str:
            f"{stats.get('output_tokens')} output tokens", ""]
     decision = data.get("decision")
     if decision:
-        out += [f"## Decision: {decision['action']} (valid)", "",
-                f"**Reason:** {decision.get('reason') or '(none given)'}", ""]
-        out += describe_targets(decision) + [""]
+        if "actions" in decision:
+            out += [f"## Turn: {decision.get('time', 'legacy')} (valid)", ""]
+            for action in decision["actions"]:
+                out += [f"**{action['action']}**: {action.get('reason', '')}", ""]
+                out += describe_targets(action) + [""]
+        else:
+            out += [f"## Decision: {decision['action']} (valid)", "",
+                    f"**Reason:** {decision.get('reason') or '(none given)'}", ""]
+            out += describe_targets(decision) + [""]
         out += describe_memory(decision.get("memory_update"))
     else:
         out += ["## Decision: INVALID", "", f"`{data.get('invalid')}`", "",

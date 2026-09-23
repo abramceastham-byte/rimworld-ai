@@ -28,24 +28,37 @@ class TurnTests(unittest.TestCase):
             '{"action": "place_blueprint", "building_def": "Wall", "x": 5, "z": 5, '
             '"stuff": "WoodLog", "reason": "west wall"},'
             '{"action": "place_blueprint", "building_def": "Door", "x": 6, "z": 5, '
-            '"stuff": "WoodLog", "reason": "doorway"},'
-            '{"action": "resume", "reason": "let them build"}]}'
+            '"stuff": "WoodLog", "reason": "doorway"}], "time": "advance"}'
         )
-        self.assertEqual([a.action for a in turn.actions],
-                         ["place_blueprint", "place_blueprint", "resume"])
+        self.assertEqual([a.action for a in turn.actions], ["place_blueprint", "place_blueprint"])
         self.assertEqual(turn.actions[1].building_def, "Door")
+        self.assertEqual(turn.time, "advance")
 
     def test_limits(self) -> None:
-        one = '{"action": "wait", "reason": "x"}'
-        with self.assertRaises(ValidationError):  # empty
-            Turn.model_validate_json('{"actions": []}')
+        one = '{"action": "set_research", "project": "Brewing", "reason": "x"}'
+        Turn.model_validate_json('{"actions": [], "time": "advance"}')  # waiting is allowed
         with self.assertRaises(ValidationError):  # too many
-            Turn.model_validate_json('{"actions": [' + ",".join([one] * (MAX_ACTIONS + 1)) + "]}")
-        Turn.model_validate_json('{"actions": [' + ",".join([one] * MAX_ACTIONS) + "]}")
+            Turn.model_validate_json(
+                '{"actions": [' + ",".join([one] * (MAX_ACTIONS + 1)) + '], "time": "hold"}')
+        Turn.model_validate_json('{"actions": [' + ",".join([one] * MAX_ACTIONS) + '], "time": "hold"}')
+
+    def test_time_must_be_chosen_every_turn(self) -> None:
+        with self.assertRaises(ValidationError):
+            Turn.model_validate_json('{"actions": []}')
+        with self.assertRaises(ValidationError):
+            Turn.model_validate_json('{"actions": [], "time": "pause"}')
+        with self.assertRaises(ValidationError):  # the old time actions are gone
+            Turn.model_validate_json(
+                '{"actions": [{"action": "resume", "reason": "go"}], "time": "hold"}')
+
+    def test_time_comes_after_the_orders(self) -> None:
+        # Constrained decoding writes fields in schema order: the model should
+        # pick advance/hold knowing what it has just ordered.
+        self.assertEqual(list(Turn.model_json_schema()["properties"])[:2], ["actions", "time"])
 
     def test_memory_update_sits_beside_the_actions(self) -> None:
         turn = Turn.model_validate_json(
-            '{"actions": [{"action": "wait", "reason": "planning"}], '
+            '{"actions": [], "time": "hold", '
             '"memory_update": {"observation": "The steel is forbidden."}}'
         )
         self.assertEqual(turn.memory_update.observation, "The steel is forbidden.")
@@ -53,8 +66,8 @@ class TurnTests(unittest.TestCase):
     def test_a_bad_action_rejects_the_whole_turn(self) -> None:
         with self.assertRaises(ValidationError):
             Turn.model_validate_json(
-                '{"actions": [{"action": "wait", "reason": "ok"}, '
-                '{"action": "set_bill", "reason": "no ids"}]}'
+                '{"actions": [{"action": "set_research", "project": "Brewing", "reason": "ok"}, '
+                '{"action": "set_bill", "reason": "no ids"}], "time": "hold"}'
             )
 
 
@@ -64,11 +77,12 @@ class TurnTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Turn.model_validate_json(
                 '{"actions": [{"action": "create_growing_zone", "plant": "Plant_Potato", '
-                '"x": 110, "z": 120, "rotation": 0, "stuff": null, "reason": "potatoes"}]}'
+                '"x": 110, "z": 120, "rotation": 0, "stuff": null, "reason": "potatoes"}], '
+                '"time": "hold"}'
             )
         Turn.model_validate_json(
             '{"actions": [{"action": "create_growing_zone", "plant": "Plant_Potato", '
-            '"x1": 110, "z1": 120, "x2": 113, "z2": 123, "reason": "potatoes"}]}'
+            '"x1": 110, "z1": 120, "x2": 113, "z2": 123, "reason": "potatoes"}], "time": "hold"}'
         )
 
     def test_action_is_the_first_field_of_every_action(self) -> None:

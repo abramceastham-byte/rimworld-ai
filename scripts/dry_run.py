@@ -16,14 +16,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from rimagent.agent import (
-    TICKS_PER_SECOND,
-    TimeMode,
-    Turn,
-    build_prompt,
-    describe_map,
-    describe_time,
-)
+from rimagent.agent import TimeMode, Turn, prepare_turn
 from rimagent.blueprints import BlueprintTracker
 from rimagent.zones import ZoneTracker
 from rimagent.memory import AgentMemory
@@ -32,32 +25,17 @@ from rimagent.rimapi import RimApiClient
 from rimagent.runlog import stamped_name
 
 
-def start_mode(state) -> TimeMode:
-    """The time mode a real run would start in (see agent.run)."""
-    if state.is_paused:
-        return TimeMode(paused=True, reason="it was already paused when this session started")
-    return TimeMode(paused=False)
+def live_context(client: RimApiClient) -> dict:
+    """The prompt and choices a real run's first turn would get (see agent.run)."""
+    memory = AgentMemory(read_only=True)
+    return prepare_turn(client, memory,
+        BlueprintTracker(memory.memory_dir / "blueprints.json"),
+        ZoneTracker(memory.memory_dir / "zones.json"),
+        TimeMode(True, "session start"), read_only=True)
 
 
 def live_prompt(client: RimApiClient) -> str:
-    """The prompt a real step would build right now (as in agent.run's first step)."""
-    state, colonists = client.get_state(), client.get_colonists()
-    memory = AgentMemory()
-    blueprints = BlueprintTracker(memory.memory_dir / "blueprints.json")
-    zones = ZoneTracker(memory.memory_dir / "zones.json")
-    map_lines = describe_map(
-        colonists, client.get_terrain(), client.get_game_defs(), zones.items, [],
-        client.get_finished_research(), client.get_items(), client.get_trees(),
-        blueprints.check(client, forget_finished=False), client.get_buildings(),
-        client.check_area,
-    )
-    return build_prompt(
-        state, colonists, client.get_alerts(), client.get_threats(), [], client.get_work_types(),
-        client.get_work_tables(), client.get_research(),
-        describe_time(start_mode(state), None, 10 * TICKS_PER_SECOND, 3 * TICKS_PER_SECOND),
-        memory,
-        map_lines,
-    )
+    return live_context(client)["prompt"]
 
 
 def main() -> None:
@@ -76,13 +54,18 @@ def main() -> None:
         num_ctx=args.num_ctx,
     )
     with RimApiClient() as client:
-        prompt = live_prompt(client)
+        context = live_context(client)
+        prompt = context["prompt"]
+        if model.schema is not None:
+            model.schema = context["choices"].schema()
     if args.show_prompt:
         print(prompt, "\n")
 
     reply = model(prompt)
     try:
-        decision = Turn.model_validate_json(reply).model_dump(exclude_none=True)
+        turn = Turn.model_validate_json(reply)
+        context["choices"].validate(turn)
+        decision = turn.model_dump(exclude_none=True)
         problem = None
     except (ValidationError, ValueError) as e:
         decision, problem = None, str(e)
@@ -99,7 +82,7 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
         "settings": model.describe(), "stats": stats, "prompt": prompt,
-        "thinking": model.last_thinking, "reply": reply,
+        "thinking": model.last_thinking, "reply": reply, "choice_schema": context["choices"].schema(),
         "decision": decision, "invalid": problem,
     }, indent=2), encoding="utf-8")
     print(f"\nSaved to {out}")

@@ -181,6 +181,19 @@ def footprint(x: int, z: int, size: tuple[int, int], rotation: int) -> Rect:
     return Rect(x1, z1, x1 + w - 1, z1 + d - 1)
 
 
+def room_layout(rect: Rect, door_side: str) -> list[tuple[str, int, int]]:
+    """Outer walls with exactly one centred door, no duplicate corner cells."""
+    if not (4 <= rect.x2 - rect.x1 + 1 <= 15 and 4 <= rect.z2 - rect.z1 + 1 <= 15):
+        raise ValueError("room outer dimensions must each be 4..15 cells")
+    mx, mz = (rect.x1 + rect.x2) // 2, (rect.z1 + rect.z2) // 2
+    doors = {"north": (mx, rect.z2), "south": (mx, rect.z1),
+             "east": (rect.x2, mz), "west": (rect.x1, mz)}
+    if door_side not in doors:
+        raise ValueError("door_side must be north/east/south/west")
+    return [("Door" if (x, z) == doors[door_side] else "Wall", x, z)
+            for x, z in rect if x in (rect.x1, rect.x2) or z in (rect.z1, rect.z2)]
+
+
 class TerrainMap:
     """RIMAPI's /map/terrain grid, decoded.
 

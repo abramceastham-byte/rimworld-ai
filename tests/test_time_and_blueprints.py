@@ -1,4 +1,4 @@
-"""Loop-controlled game time, blueprint tracking, and the work-table check.
+"""Loop-controlled game time and blueprint tracking.
 
 Run from the repo root:  python -m unittest tests/test_time_and_blueprints.py -v
 """
@@ -15,12 +15,10 @@ from rimagent.agent import (
     let_time_run,
     mode_after_decision,
     mode_after_window,
-    require_work_table,
 )
 from rimagent.blueprints import BlueprintTracker, status_from_things
 from rimagent.construction import Rect
 from rimagent.events import GameEvent
-from rimagent.rimapi import WorkTable
 
 
 class FakeGame:
@@ -96,24 +94,21 @@ class LetTimeRunTests(unittest.TestCase):
 
 
 class TimeModeTests(unittest.TestCase):
-    def test_pause_and_resume_switch_the_mode(self) -> None:
-        running = TimeMode(paused=False)
-        paused = mode_after_decision(running, "pause")
-        self.assertEqual((paused.paused, paused.reason, paused.paused_decisions),
-                         (True, "you paused it", 0))
-        self.assertFalse(mode_after_decision(paused, "resume").paused)
+    def test_hold_counts_consecutive_turns(self) -> None:
+        mode = TimeMode(paused=True, reason="session start")
+        for _ in range(3):
+            mode = mode_after_decision(mode, "hold")
+        self.assertEqual((mode.paused, mode.paused_decisions), (True, 3))
 
-    def test_orders_while_paused_keep_it_paused_and_are_counted(self) -> None:
-        mode = TimeMode(paused=True, reason="you paused it")
-        for action in ("place_blueprint", "chop_trees", "wait", "pause"):
-            mode = mode_after_decision(mode, action)
-        self.assertTrue(mode.paused)
-        self.assertEqual(mode.paused_decisions, 4)
-        self.assertEqual(mode.reason, "you paused it")
+    def test_advance_resets_the_count(self) -> None:
+        mode = mode_after_decision(TimeMode(True, "you chose hold", 5), "advance")
+        self.assertEqual((mode.paused, mode.paused_decisions), (False, 0))
+        # Nothing is inherited: the next hold starts counting again.
+        self.assertEqual(mode_after_decision(mode, "hold").paused_decisions, 1)
 
-    def test_orders_while_running_keep_it_running(self) -> None:
-        self.assertFalse(mode_after_decision(TimeMode(paused=False), "place_blueprint").paused)
-        self.assertFalse(mode_after_decision(TimeMode(paused=False), "resume").paused)
+    def test_anything_else_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            mode_after_decision(TimeMode(paused=False), "resume")
 
     def test_the_game_pausing_itself_switches_to_paused(self) -> None:
         window = TimeWindow(2.0, 100, "the game paused itself for a threat (letter: Raid)",
@@ -128,26 +123,20 @@ class TimeModeTests(unittest.TestCase):
 
 
 class DescribeTimeTests(unittest.TestCase):
-    def test_running(self) -> None:
+    def test_offers_both_choices_with_their_length(self) -> None:
         text = describe_time(TimeMode(paused=False), None, 600, 180)
-        self.assertIn("Time is running", text)
-        self.assertIn("runs for 0.2 in-game hours (0.1 while a threat is active)", text)
-        self.assertIn("choose pause to stop time", text)
+        self.assertIn("Choose advance for 600 game ticks (180 during danger), or hold", text)
+        self.assertIn("Consecutive held turns: 0.", text)
 
-    def test_paused_invites_planning(self) -> None:
-        text = describe_time(TimeMode(True, "you paused it", 0), None, 600, 180)
-        self.assertIn("The game is paused (you paused it). This is a good time to plan", text)
-        self.assertIn("start on it all once you resume", text)
-        self.assertNotIn("Paused for", text)  # no count on the first paused decision
-
-    def test_paused_count(self) -> None:
-        self.assertIn("(Paused for 1 decision.)", describe_time(TimeMode(True, "x", 1), None, 600, 180))
-        self.assertIn("(Paused for 6 decisions.)", describe_time(TimeMode(True, "x", 6), None, 600, 180))
+    def test_says_why_it_is_paused(self) -> None:
+        text = describe_time(TimeMode(True, "RimWorld paused it for a threat: Raid", 0), None, 600, 180)
+        self.assertIn("Last pause: RimWorld paused it for a threat: Raid.", text)
 
     def test_says_what_happened_while_time_ran(self) -> None:
         window = TimeWindow(seconds=2.1, ticks=1250, stopped_by="a threat arrived (letter: Raid)")
         text = describe_time(TimeMode(paused=False), window, 600, 180)
-        self.assertIn("ran 2.1s (0.5 in-game hours) and stopped early: a threat arrived", text)
+        self.assertIn("Last window: 1250 ticks, 2.1s real time.", text)
+        self.assertIn("Interrupted: a threat arrived (letter: Raid).", text)
 
 
 class BlueprintTests(unittest.TestCase):
@@ -175,16 +164,6 @@ class BlueprintTests(unittest.TestCase):
         report = tracker.check(client)
         self.assertEqual([s for _, s in report], ["under construction", "built"])
         self.assertEqual([b.def_name for b in BlueprintTracker(path).items], ["Bed"])
-
-
-class WorkTableCheckTests(unittest.TestCase):
-    def test_refuses_ids_that_are_not_built_work_tables(self) -> None:
-        with self.assertRaisesRegex(ValueError, "not a built work table. Work tables now: none yet"):
-            require_work_table(1, [])
-        table = WorkTable(id=77, thing_def="Campfire", label="campfire", position={"x": 1, "z": 1})
-        with self.assertRaisesRegex(ValueError, "77 \\(campfire\\)"):
-            require_work_table(3, [table])
-        require_work_table(77, [table])  # a real table is fine
 
 
 if __name__ == "__main__":

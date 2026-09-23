@@ -33,6 +33,7 @@ class TrackedBlueprint(BaseModel):
     x: int
     z: int
     rotation: int = 0
+    floor: bool = False
     cells: tuple[int, int, int, int]  # x1, z1, x2, z2 the building covers
 
     def area(self) -> Rect:
@@ -68,10 +69,12 @@ class BlueprintTracker:
             json.dumps([b.model_dump() for b in self.items], indent=2), encoding="utf-8"
         )
 
-    def add(self, def_name: str, stuff: str | None, x: int, z: int, rotation: int, area: Rect) -> None:
+    def add(self, def_name: str, stuff: str | None, x: int, z: int, rotation: int, area: Rect,
+            floor: bool = False) -> None:
+        self.items = [b for b in self.items if (b.def_name, b.x, b.z) != (def_name, x, z)]
         self.items.append(TrackedBlueprint(
             def_name=def_name, stuff=stuff, x=x, z=z, rotation=rotation,
-            cells=(area.x1, area.z1, area.x2, area.z2),
+            cells=(area.x1, area.z1, area.x2, area.z2), floor=floor,
         ))
         self.save()
 
@@ -84,6 +87,8 @@ class BlueprintTracker:
         report = []
         for bp in self.items:
             here = [t.def_name for t in client.get_things_at(bp.x, bp.z, map_id)]
+            if bp.floor and client.get_terrain(map_id).at(bp.x, bp.z) == bp.def_name:
+                here.append(bp.def_name)
             report.append((bp, status_from_things(bp.def_name, here)))
         still_open = [bp for bp, status in report if status in ("waiting", "under construction")]
         if forget_finished and len(still_open) != len(self.items):

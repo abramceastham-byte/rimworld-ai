@@ -6,7 +6,7 @@ The client unwraps it and raises RimApiError when success is false.
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import httpx
@@ -28,6 +28,7 @@ from rimagent.construction import (
     TerrainMap,
     footprint,
     is_tree,
+    room_layout,
 )
 
 # Values accepted by POST /api/v1/game/speed
@@ -144,6 +145,8 @@ class MapThing(BaseModel):
     position: MapPosition
     stack_count: int = 1
     is_forbidden: bool = False
+    rotation: int = 0
+    stuff_def_name: str | None = None
 
 
 class Building(BaseModel):
@@ -239,6 +242,9 @@ class GameDefs:
     terrain: dict[str, TerrainInfo]
     crop_fertility_min: dict[str, float]
     thing_names: frozenset[str]
+    wood_plants: tuple[str, ...] = ()
+    plants: dict[str, dict] = field(default_factory=dict)
+    animals: dict[str, dict] = field(default_factory=dict)
 
 
 # What a hostile group's RimWorld "lord job" means, in plain words.
@@ -331,6 +337,20 @@ class RimApiClient:
         base_url = base_url or load_settings().rimapi_url
         self._http = httpx.Client(base_url=base_url, timeout=timeout)
         self._defs: GameDefs | None = None
+        self._terrain_cache: dict[int, TerrainMap] = {}
+        self._finished_cache: set[str] | None = None
+        self._cell_cache: dict[tuple[int, int, int], list[MapThing]] = {}
+        self._plants_cache: dict[int, list[dict]] = {}
+        # What the last construction call asked for, cell by cell, so the loop
+        # can track it even if the request failed part way.
+        self.submitted_blueprints: list[dict] = []
+
+    def begin_snapshot(self) -> None:
+        """Forget cached reads. Any write does this too (see _request)."""
+        self._terrain_cache.clear()
+        self._cell_cache.clear()
+        self._plants_cache.clear()
+        self._finished_cache = None
 
     def close(self) -> None:
         self._http.close()
@@ -342,6 +362,8 @@ class RimApiClient:
         self.close()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        if method != "GET" and path not in ("/api/v1/builder/check-zone", "/api/v1/builder/copy"):
+            self.begin_snapshot()
         response = self._http.request(method, path, **kwargs)
         try:
             body = response.json()
@@ -435,7 +457,7 @@ class RimApiClient:
             recipes = self._request(
                 "GET",
                 "/api/v1/buildings/recipes",
-                params={"building_id": table_id},
+                params={"building_id": table_id, "only_researched": True},
             )
             bills = self._request(
                 "GET",
@@ -487,7 +509,7 @@ class RimApiClient:
             for recipe in self._request(
                 "GET",
                 "/api/v1/buildings/recipes",
-                params={"building_id": building_id},
+                params={"building_id": building_id, "only_researched": True},
             )
         ]
         if recipe_def_name not in {recipe.def_name for recipe in recipes}:
@@ -559,12 +581,20 @@ class RimApiClient:
                     p["def_name"]: float(p.get("fertility_min") or 0.0) for p in data["plant_defs"]
                 },
                 thing_names=frozenset(t["def_name"] for t in data["things_defs"]),
+                wood_plants=tuple(p["def_name"] for p in data["plant_defs"]
+                                  if p.get("harvested_thing_def") == "WoodLog"),
+                plants={p["def_name"]: p for p in data["plant_defs"]},
+                animals={p["def_name"]: p for p in data.get("animal_defs", [])},
             )
         return self._defs
 
     def get_terrain(self, map_id: int = 0) -> TerrainMap:
+        if map_id in self._terrain_cache:
+            return self._terrain_cache[map_id]
         data = self._request("GET", "/api/v1/map/terrain", params={"map_id": map_id})
-        return TerrainMap(data["width"], data["height"], data["palette"], data["grid"])
+        terrain = TerrainMap(data["width"], data["height"], data["palette"], data["grid"])
+        self._terrain_cache[map_id] = terrain
+        return terrain
 
     def get_buildings(self, map_id: int = 0) -> list[Building]:
         """The colony's own buildings, including frames under construction."""
@@ -585,6 +615,7 @@ class RimApiClient:
         progress = self._request("GET", "/api/v1/research/progress")
         projects = [ResearchProject.model_validate(p)
                     for p in self._request("GET", "/api/v1/research/tree")["projects"]]
+        self._finished_cache = {p.name for p in projects if p.is_finished}
         current = None
         if progress.get("name") and progress["name"] != "none":
             current = ResearchProject.model_validate(progress)
@@ -599,6 +630,8 @@ class RimApiClient:
     def set_research(self, project: str) -> str:
         """Start researching a project. Returns its label."""
         state = self.get_research()
+        if state.current and state.current.name == project:
+            return "unchanged: already researching " + project
         match = next((p for p in state.available if p.name.lower() == project.lower()), None)
         if match is None:
             choices = ", ".join(p.name for p in state.available[:10]) or "none"
@@ -624,6 +657,8 @@ class RimApiClient:
         return match.label or match.name
 
     def get_finished_research(self) -> set[str]:
+        if self._finished_cache is not None:
+            return self._finished_cache
         return set(self._request("GET", "/api/v1/research/finished")["finished_projects"])
 
     def check_area(self, rect: Rect, map_id: int = 0) -> AreaCheck:
@@ -752,6 +787,8 @@ class RimApiClient:
                 f"{AreaCheck.describe(blocking)}"
             )
 
+        self.submitted_blueprints = [dict(def_name=def_name, stuff=stuff, x=x, z=z,
+                                          rotation=rotation, area=area)]
         self._request(
             "POST",
             "/api/v1/builder/blueprint",
@@ -779,6 +816,19 @@ class RimApiClient:
         )
         return area
 
+    def construction_at(self, name: str, x: int, z: int, rotation: int = 0, map_id: int = 0,
+                        stuff: str | None = None) -> bool:
+        """Match definition, anchor and orientation, retaining existing material.
+
+        RIMAPI 1.10's things-at uses ResourcesHelper.ThingToDto, which leaves
+        StuffDefName null (unlike ThingDto.ToDto). Check material when supplied;
+        otherwise explicitly report preservation, never claim a replacement.
+        """
+        return any(t.def_name in (name, "Blueprint_" + name, "Frame_" + name)
+                   and (t.position.x, t.position.z) == (x, z) and t.rotation == rotation
+                   and (t.stuff_def_name is None or t.stuff_def_name == stuff)
+                   for t in self.get_things_at(x, z, map_id))
+
     def _blocked_cells(self, rect: Rect, map_id: int) -> dict[tuple[int, int], str]:
         """Cells in a rectangle that can't be built on, and why.
 
@@ -789,10 +839,18 @@ class RimApiClient:
         check = self.check_area(rect, map_id)
         blocked: dict[tuple[int, int], str] = {}
         for issue in check.terrain + check.ores + check.buildings:
-            blocked[(issue.x, issue.z)] = issue.label or issue.def_name or "something"
-        for issue in check.zones:
-            if issue.zone_type != "Stockpile":  # building inside a stockpile is fine
-                blocked[(issue.x, issue.z)] = f"{issue.label or 'a zone'} (zone)"
+            if rect.contains(issue.x, issue.z):  # a building's anchor can lie outside
+                blocked[(issue.x, issue.z)] = issue.label or issue.def_name or "something"
+        # check-zone reports ONE cell per zone, and a building at its anchor
+        # only. Asked about a single cell, it does see a building covering it.
+        # So when a field or a building touches the area, check cell by cell
+        # rather than treat those few cells as everything that is taken.
+        if check.buildings or any(i.zone_type != "Stockpile" for i in check.zones):
+            for x, z in rect:
+                cell_check = self.check_area(Rect(x, z, x, z), map_id)
+                issues = cell_check.buildings + [i for i in cell_check.zones if i.zone_type != "Stockpile"]
+                if issues:
+                    blocked[(x, z)] = AreaCheck.describe(issues)
         for x, z in rect:
             for thing in self.get_things_at(x, z, map_id):
                 if thing.def_name.startswith(("Blueprint_", "Frame_")):
@@ -820,8 +878,12 @@ class RimApiClient:
 
         blocked = self._blocked_cells(rect, map_id)
         free = [cell for cell in rect if cell not in blocked]
+        if not free and all(self.construction_at(def_name, x, z, map_id=map_id, stuff=stuff) for x, z in rect):
+            return f"unchanged: {def_name} already built or queued over {rect}; existing materials retained"
         if not free:
             raise ValueError(f"every cell in {rect} is taken: {AreaCheck.describe_cells(blocked)}")
+        self.submitted_blueprints = [dict(def_name=def_name, stuff=stuff, x=x, z=z,
+                                          rotation=0, area=Rect(x, z, x, z)) for x, z in free]
         self._request("POST", "/api/v1/builder/blueprint", json={
             "map_id": map_id,
             "position": {"x": rect.x1, "y": 0, "z": rect.z1},
@@ -836,6 +898,64 @@ class RimApiClient:
         skipped = (f"; skipped {len(blocked)} cells: {AreaCheck.describe_cells(blocked)}"
                    if blocked else "")
         return f"{len(free)} {def_name} blueprints from ({rect.x1},{rect.z1}) to ({rect.x2},{rect.z2}){skipped}"
+
+    def build_room(self, rect: Rect, stuff: str, door_side: str, map_id: int = 0) -> str:
+        """Blueprint a closed ring of walls with one door, in a single request.
+
+        Only the perimeter is checked: whatever is inside stays inside. Walls
+        (built or planned) and natural rock already on the perimeter count as
+        part of the ring, so rooms can share a wall or back onto a cliff. Any
+        other obstruction refuses the whole room: half a ring is no room.
+        """
+        layout = room_layout(rect, door_side)
+        if stuff not in BUILDINGS["Wall"].materials() or stuff not in BUILDINGS["Door"].materials():
+            raise ValueError(f"{stuff!r} can't build walls and doors; choose one of "
+                             f"{', '.join(BUILDINGS['Wall'].materials())}")
+        terrain = self.get_terrain(map_id)
+        _check_rect(rect, terrain, MAX_ZONE_CELLS)
+
+        # The four sides as straight strips, so a building inside the room
+        # doesn't trigger a cell-by-cell check of the whole interior.
+        sides = {Rect(rect.x1, rect.z1, rect.x2, rect.z1), Rect(rect.x1, rect.z2, rect.x2, rect.z2),
+                 Rect(rect.x1, rect.z1, rect.x1, rect.z2), Rect(rect.x2, rect.z1, rect.x2, rect.z2)}
+        blocked: dict[tuple[int, int], str] = {}
+        rock = set()
+        for side in sides:
+            blocked.update(self._blocked_cells(side, map_id))
+            rock |= {(i.x, i.z) for i in self.check_area(side, map_id).ores}
+        wanted = {(x, z): name for name, x, z in layout}
+        reused, refused = [], {}
+        for cell, why in blocked.items():
+            here = {t.def_name for t in self.get_things_at(*cell, map_id)}
+            name = wanted[cell]
+            if here & {name, f"Blueprint_{name}", f"Frame_{name}"} or (name == "Wall" and cell in rock):
+                reused.append(cell)
+            else:
+                refused[cell] = why
+        if refused:
+            raise ValueError(f"room {rect} is blocked on its perimeter: "
+                             f"{AreaCheck.describe_cells(refused)}; nothing was placed")
+
+        todo = [(name, x, z) for name, x, z in layout if (x, z) not in reused]
+        walls = sum(1 for name, _, _ in todo if name == "Wall")
+        doors = len(todo) - walls
+        cost = walls * BUILDINGS["Wall"].stuff_count + doors * BUILDINGS["Door"].stuff_count
+        self.submitted_blueprints = [dict(def_name=name, stuff=stuff, x=x, z=z,
+                                          rotation=0, area=Rect(x, z, x, z)) for name, x, z in todo]
+        if not todo:
+            return f"unchanged: room perimeter {rect} already built or queued; existing materials retained"
+        if todo:
+            self._request("POST", "/api/v1/builder/blueprint", json={
+                "map_id": map_id, "position": {"x": rect.x1, "y": 0, "z": rect.z1},
+                "blueprint": {"width": rect.x2 - rect.x1 + 1, "height": rect.z2 - rect.z1 + 1,
+                              "floors": [], "buildings": [
+                                  {"def_name": name, "stuff_def_name": stuff, "rel_x": x - rect.x1,
+                                   "rel_z": z - rect.z1, "rotation": 0} for name, x, z in todo]},
+                "clear_obstacles": False,
+            })
+        kept = f"; kept {len(reused)} existing wall/rock cells" if reused else ""
+        return (f"room {rect} with a {door_side} door: {walls} walls and {doors} door planned, "
+                f"needing {cost} {stuff}{kept}; not roofed or floored yet")
 
     def build_floor(self, rect: Rect, terrain: str, map_id: int = 0) -> str:
         """Blueprint flooring over a rectangle, skipping cells that are taken."""
@@ -852,9 +972,21 @@ class RimApiClient:
         check = self.check_area(rect, map_id)
         blocked = {(i.x, i.z): i.label or i.def_name or "something"
                    for i in check.terrain + check.ores}
+        ground = self.get_terrain(map_id)
+        for x, z in rect:
+            if ground.at(x, z) == terrain:
+                blocked[(x, z)] = "already floored"
+            for thing in self.get_things_at(x, z, map_id):
+                if any(thing.def_name == prefix + name for name in FLOORS
+                       for prefix in ("Blueprint_", "Frame_")):
+                    blocked[(x, z)] = "floor already planned"
         free = [cell for cell in rect if cell not in blocked]
+        if not free and all(ground.at(x, z) == terrain or self.construction_at(terrain, x, z, map_id=map_id) for x, z in rect):
+            return f"unchanged: {terrain} already laid or queued over {rect}"
         if not free:
             raise ValueError(f"no cell in {rect} can take a floor: {AreaCheck.describe_cells(blocked)}")
+        self.submitted_blueprints = [dict(def_name=terrain, stuff=None, x=x, z=z,
+                                          rotation=0, area=Rect(x, z, x, z), floor=True) for x, z in free]
         self._request("POST", "/api/v1/builder/blueprint", json={
             "map_id": map_id,
             "position": {"x": rect.x1, "y": 0, "z": rect.z1},
@@ -887,25 +1019,44 @@ class RimApiClient:
             "GET", "/api/v1/map/things", params={"map_id": map_id}
         )]
 
+    def get_plants(self, map_id: int = 0) -> list[dict]:
+        """Every plant on the map (~28,000, about 7 MB), cached for one snapshot.
+
+        One read takes ~0.6 s. RIMAPI's def_name filter runs after the full
+        scan, so filtering per definition is slower: 26 wood defs took ~8 s.
+        """
+        if map_id not in self._plants_cache:
+            self._plants_cache[map_id] = self._request(
+                "GET", "/api/v1/map/plants", params={"map_id": map_id}) or []
+        return self._plants_cache[map_id]
+
     def get_trees(self, map_id: int = 0) -> list[MapThing]:
-        """Every tree on the map. /map/plants lists all ~25,000 plants (about 7 MB),
-        so call this sparingly."""
-        return [
-            MapThing.model_validate(p)
-            for p in self._request("GET", "/api/v1/map/plants", params={"map_id": map_id})
-            if is_tree(p.get("def_name", ""))
-        ]
+        """Standing plants that give wood when cut, modded species included.
+
+        Stumps and burned trees also yield wood but aren't trees to a player,
+        so they're left out, as is_tree always did.
+        """
+        wood = {n for n in self.get_game_defs().wood_plants
+                if "Stump" not in n and "Burned" not in n}
+        wanted = (lambda name: name in wood) if wood else is_tree
+        return [MapThing.model_validate(p) for p in self.get_plants(map_id)
+                if wanted(p.get("def_name", ""))]
 
     def get_things_at(self, x: int, z: int, map_id: int = 0) -> list[MapThing]:
         """Everything on one cell, including blueprints (Blueprint_<def>) and
         buildings under construction (Frame_<def>), which no list endpoint shows."""
         # RIMAPI reads this GET request's parameters from a JSON body.
+        key = (map_id, x, z)
+        if key in self._cell_cache:
+            return self._cell_cache[key]
         data = self._request(
             "GET",
             "/api/v1/map/things-at",
             json={"map_id": map_id, "position": {"x": x, "y": 0, "z": z}},
         )
-        return [MapThing.model_validate(t) for t in data or []]
+        things = [MapThing.model_validate(t) for t in data or []]
+        self._cell_cache[key] = things
+        return things
 
     def allow_items(self, rect: Rect, map_id: int = 0) -> int:
         """Unforbid every forbidden item in a rectangle so colonists can use it.

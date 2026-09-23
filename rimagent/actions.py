@@ -42,18 +42,6 @@ class RectAction(BaseAction):
         return Rect.from_corners(self.x1, self.z1, self.x2, self.z2)
 
 
-class Wait(BaseAction):
-    action: Literal["wait"]
-
-
-class Pause(BaseAction):
-    action: Literal["pause"]
-
-
-class Resume(BaseAction):
-    action: Literal["resume"]
-
-
 class EnableWork(BaseAction):
     action: Literal["enable_work"]
     colonist: str
@@ -96,7 +84,7 @@ class ChopTrees(RectAction):
 
 
 class BuildWall(RectAction):
-    """A straight run of walls, so a room is four actions instead of a dozen."""
+    """A straight run of walls; build_room is the one-action way to a whole room."""
 
     action: Literal["build_wall"]
     stuff: str
@@ -105,6 +93,15 @@ class BuildWall(RectAction):
 class BuildFloor(RectAction):
     action: Literal["build_floor"]
     terrain: str  # floor def name, e.g. "WoodPlankFloor"
+
+
+class BuildRoom(RectAction):
+    """A closed ring of walls around the outer rectangle, with one centred door
+    in the chosen side (see RimApiClient.build_room)."""
+
+    action: Literal["build_room"]
+    stuff: str
+    door_side: Literal["north", "east", "south", "west"]
 
 
 class SetResearch(BaseAction):
@@ -123,9 +120,9 @@ class PlaceBlueprint(BaseAction):
 
 Action = Annotated[
     Union[
-        Wait, Pause, Resume, EnableWork, DisableWork, SetBill, SetResearch,
+        EnableWork, DisableWork, SetBill, SetResearch,
         CreateGrowingZone, CreateStockpile, PlaceBlueprint, Designate,
-        BuildWall, BuildFloor,
+        BuildWall, BuildFloor, BuildRoom,
         AllowItems, ChopTrees,
     ],
     Field(discriminator="action"),
@@ -133,14 +130,16 @@ Action = Annotated[
 
 
 class Turn(BaseModel):
-    """One reply: up to MAX_ACTIONS actions, carried out in order.
+    """One reply: up to MAX_ACTIONS orders, carried out in order while the game
+    is paused, then a choice of whether game time runs before the next turn.
 
-    Several actions at once let the model lay out a room or set up a colonist
-    in one go, instead of one cell per decision. Pausing first (see TimeMode)
-    means no game time passes in between.
+    Time is chosen every turn, so no pause state can be forgotten. It comes
+    after the orders: constrained decoding writes fields in schema order, and
+    the model should choose it knowing what it just ordered.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    actions: list[Action] = Field(min_length=1, max_length=MAX_ACTIONS)
+    actions: list[Action] = Field(max_length=MAX_ACTIONS)
+    time: Literal["advance", "hold"]
     memory_update: MemoryUpdate | None = None

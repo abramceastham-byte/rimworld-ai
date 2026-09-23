@@ -102,11 +102,10 @@ class ZoneTrackerTests(unittest.TestCase):
 class NudgeTests(unittest.TestCase):
     def test_says_plainly_when_nothing_is_happening(self) -> None:
         quiet = describe_time(TimeMode(True, "you paused it", PAUSED_NUDGE_AFTER - 1), None, 600, 180)
-        self.assertNotIn("NOTHING HAS HAPPENED", quiet)
+        self.assertNotIn("No work can progress", quiet)
 
         loud = describe_time(TimeMode(True, "you paused it", PAUSED_NUDGE_AFTER), None, 600, 180)
-        self.assertTrue(loud.startswith("NOTHING HAS HAPPENED FOR 4 DECISIONS"))
-        self.assertIn("Choose resume", loud)
+        self.assertIn("Consecutive held turns: 4. No work can progress while held; choose advance", loud)
 
 
 if __name__ == "__main__":

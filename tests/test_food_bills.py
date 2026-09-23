@@ -15,6 +15,9 @@ RECIPES = [
         "description": "Cook a simple meal.",
         "work_amount": 300,
         "work_skill": "Cooking",
+        # As RIMAPI 1.10 sends them (extra fields, kept by Recipe).
+        "ingredients": [{"filter_label": "raw food", "count": 10.0}],
+        "products": [{"thing_def": "MealSimple", "count": 1}],
     }
 ]
 
@@ -54,7 +57,7 @@ class BillClientTests(unittest.TestCase):
                 call(
                     "GET",
                     "/api/v1/buildings/recipes",
-                    params={"building_id": 12},
+                    params={"building_id": 12, "only_researched": True},
                 ),
                 call(
                     "GET",
@@ -121,6 +124,17 @@ class BillClientTests(unittest.TestCase):
             self.client.set_target_bill(12, "InventedRecipe", 20)
 
         self.assertEqual(request.call_count, 1)
+        self.assertTrue(request.call_args.kwargs['params']['only_researched'])
+
+    def test_observation_requests_only_unlocked_recipes(self) -> None:
+        request = Mock(side_effect=[[
+            {'id': 12, 'thing_def': 'ElectricStove', 'label': 'stove', 'position': {'x': 1, 'z': 1}}
+        ], RECIPES, []])
+        self.client._request = request
+        tables = self.client.get_work_tables()
+        self.assertEqual([r.def_name for r in tables[0].recipes], ['CookMealSimple'])
+        self.assertEqual(request.call_args_list[1], call('GET', '/api/v1/buildings/recipes',
+                         params={'building_id': 12, 'only_researched': True}))
 
 
 class PromptDescriptionTests(unittest.TestCase):
@@ -139,8 +153,10 @@ class PromptDescriptionTests(unittest.TestCase):
         description = "\n".join(describe_work_table(table))
 
         self.assertIn("id 12", description)
-        self.assertIn("CookMealSimple", description)
-        self.assertIn("cook simple meal", description)
+        # Ingredients from RIMAPI; the product is left out when the def name says it.
+        self.assertIn("CookMealSimple: 10 raw food", description)
+        self.assertNotIn("-> 1 MealSimple", description)
+        self.assertIn("use Cooking", description)
 
 
 if __name__ == "__main__":

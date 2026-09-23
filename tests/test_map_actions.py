@@ -7,7 +7,7 @@ import unittest
 
 from pydantic import ValidationError
 
-from rimagent.actions import CreateGrowingZone, Wait, CreateStockpile, Designate, PlaceBlueprint
+from rimagent.actions import CreateGrowingZone, CreateStockpile, Designate, PlaceBlueprint, SetResearch
 from rimagent.construction import Rect, TerrainMap, footprint
 from rimagent.rimapi import RimApiClient
 
@@ -341,10 +341,11 @@ class DecisionTests(unittest.TestCase):
 
     def test_reason_is_required(self) -> None:
         with self.assertRaises(ValidationError):
-            Wait.model_validate_json('{"action": "wait"}')
+            SetResearch.model_validate_json('{"action": "set_research", "project": "Brewing"}')
         with self.assertRaises(ValidationError):
-            Wait.model_validate_json('{"action": "wait", "reason": ""}')
-        self.assertIn("reason", Wait.model_json_schema()["required"])  # so Ollama enforces it
+            SetResearch.model_validate_json(
+                '{"action": "set_research", "project": "Brewing", "reason": ""}')
+        self.assertIn("reason", SetResearch.model_json_schema()["required"])  # so Ollama enforces it
 
 
 if __name__ == "__main__":

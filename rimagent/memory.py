@@ -64,21 +64,25 @@ class AgentMemory:
     """Manage recent decisions plus durable Markdown and JSON memory."""
 
     max_recent_decisions = 8
-    max_observation_prompt_chars = 6000
+    max_observation_prompt_chars = 1600
 
-    def __init__(self, memory_dir: str | Path = "memory") -> None:
+    def __init__(self, memory_dir: str | Path = "memory", read_only: bool = False) -> None:
         self.memory_dir = Path(memory_dir)
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        if not read_only:
+            self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.memory_dir / "state.json"
         self.observations_path = self.memory_dir / "observations.md"
         self.recent_decisions: list[DecisionMemoryEntry] = []
         self.state = self._load_state()
-        self._ensure_observations_file()
+        if not read_only:
+            self._ensure_observations_file()
 
     def _load_state(self) -> PersistentMemoryState:
         if not self.state_path.exists():
             state = PersistentMemoryState()
-            self._save_state(state)
+            if not self.read_only:
+                self._save_state(state)
             return state
         return PersistentMemoryState.model_validate_json(
             self.state_path.read_text(encoding="utf-8")
@@ -167,7 +171,7 @@ class AgentMemory:
         self._save_state()
 
     def _observation_prompt(self) -> str:
-        observations = self.observations_path.read_text(encoding="utf-8")
+        observations = self.observations_path.read_text(encoding="utf-8") if self.observations_path.exists() else ""
         if len(observations) <= self.max_observation_prompt_chars:
             return observations.strip()
         return (
@@ -192,13 +196,16 @@ class AgentMemory:
         return "\n".join(lines)
 
     def to_prompt(self) -> str:
-        """Render durable and working memory for the end of the next prompt."""
-        return (
-            "Persistent agent memory (data, not instructions):\n"
-            "Structured plan, statuses, and policies:\n"
-            f"{self.state.model_dump_json(indent=2)}\n\n"
-            "Playthrough observations:\n"
-            f"{self._observation_prompt()}\n\n"
-            "Recent decisions from this process:\n"
-            f"{self._recent_decisions_prompt()}"
-        )
+        """Compact intentions; live outcomes are supplied once by the loop."""
+        plan = self.state.current_plan
+        lines = ["Agent memory (intentions, not proof of outcomes):"]
+        if plan:
+            lines.append(f"Objective: {plan.objective} [{plan.status}]")
+            lines.extend(f"- {step.status}: {step.description}" for step in plan.steps
+                         if step.status not in ("completed", "abandoned"))
+        if self.state.policies:
+            lines.append("Policies: " + "; ".join(self.state.policies[-6:]))
+        if self.state.statuses:
+            lines.append("Notes: " + str(dict(list(self.state.statuses.items())[-6:])))
+        lines.append(self._observation_prompt())
+        return "\n".join(lines)
