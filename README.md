@@ -211,31 +211,3 @@ timings. The thinking is only logged; it is never fed back into the next prompt.
 Leave out `--model` to use the fake model. `--num-ctx` (default 16384) sets the
 context window; Ollama's own default is smaller than the prompt and would
 silently cut it off.
-
-## Running the model on a lab machine (SSH tunnel)
-
-Ollama can run on a more powerful lab machine while RimWorld and the agent
-stay here. An SSH tunnel makes the lab machine's Ollama port appear on your
-own machine, so the agent still talks to `localhost` and nothing else changes.
-
-```powershell
-ssh -N -L 11434:localhost:11434 you@lab-machine
-```
-
-- `-L 11434:localhost:11434` means "forward my local port 11434 to port 11434
-  on the lab machine" (as seen from the lab machine itself, hence `localhost`).
-- `-N` opens the tunnel without starting a remote shell. Leave that window open.
-
-With the tunnel up, the default `OLLAMA_HOST=http://localhost:11434` already
-points at the lab machine. Check it with:
-
-```powershell
-curl http://localhost:11434/api/tags
-```
-
-If you also run Ollama locally on 11434, pick another local port for the tunnel,
-for example `-L 11500:localhost:11434`, and set `OLLAMA_HOST=http://localhost:11500`
-in `.env`. That one value is the only thing that changes.
-
-Because Ollama only needs to listen on the lab machine's own localhost, it is
-never exposed to the rest of the network.
