@@ -20,13 +20,14 @@ from rimagent.construction import Rect, TerrainInfo
 RICH_SOIL, SOIL, POOR_SOIL, BARE, WATER = "*", ".", ",", "_", "~"
 COLONIST, TREE, FORBIDDEN = "@", "T", "f"
 WALL, DOOR, BUILDING, FRAME, BLUEPRINT = "#", "+", "n", "F", "b"
+GROWING, STOCKPILE = "g", "s"
 
 DETAIL_LEGEND = (
     f"  {RICH_SOIL} rich soil  {SOIL} soil  {POOR_SOIL} poor soil  "
     f"{BARE} stone or floor, nothing grows  {WATER} water or marsh\n"
     f"  {COLONIST} colonist  {TREE} tree  {FORBIDDEN} forbidden item  "
     f"{WALL} wall  {DOOR} door  {BUILDING} building  {FRAME} being built  "
-    f"{BLUEPRINT} your blueprint"
+    f"{BLUEPRINT} your blueprint  {GROWING} growing zone  {STOCKPILE} stockpile"
 )
 OVERVIEW_LEGEND = (
     f"  {BUILDING} your base  {TREE} forest  {WATER} water  {BARE} stone, often mountain  "

@@ -27,6 +27,8 @@ from rimagent.construction import (
     CROPS,
     MAX_CHOP_TREES,
     MAX_DESIGNATE_CELLS,
+    MAX_FLOOR_CELLS,
+    MAX_WALL_RUN,
     MAX_ZONE_CELLS,
     STUFF_BY_CATEGORY,
     Rect,
@@ -40,6 +42,8 @@ from rimagent.mapview import (
     DOOR,
     FORBIDDEN,
     FRAME,
+    GROWING,
+    STOCKPILE,
     TREE,
     WALL,
     centre_of,
@@ -66,6 +70,7 @@ from rimagent.rimapi import (
     Zone,
 )
 from rimagent.runlog import RunLogger
+from rimagent.zones import TrackedZone, ZoneTracker
 
 
 GAME_FACTS = (
@@ -84,6 +89,9 @@ GAME_FACTS = (
     "- Growing zones only work on fertile soil, and crops are sown and harvested by "
     "colonists with Growing enabled.\n"
     "- Colonists sleep on the ground and lose mood until they have beds.\n"
+    "- A room is a closed ring of walls with a door in it; beds and work tables "
+    "indoors keep colonists warmer and happier. A wall on its own does nothing until "
+    "the ring is closed.\n"
     "- Wealth attracts bigger raids, so build what the colony needs, not everything.\n"
 )
 
@@ -91,8 +99,8 @@ GAME_FACTS = (
 INSTRUCTIONS = (
     "You are managing a RimWorld colony.\n"
     "Your actions are: pause, resume, wait, enable_work, disable_work, set_bill, "
-    "create_growing_zone, create_stockpile, place_blueprint, designate, allow_items, "
-    "chop_trees, set_research.\n"
+    "create_growing_zone, create_stockpile, place_blueprint, build_wall, build_floor, "
+    "designate, allow_items, chop_trees, set_research.\n"
     "Pause and resume control time. The game is always paused while you decide; while "
     "time is running, it runs for a short while after each decision. Choose pause to "
     "stop time: while paused you can give as many orders as you like, and colonists "
@@ -113,6 +121,11 @@ INSTRUCTIONS = (
     f"storage zone for all normal items. designate marks everything of one kind in a "
     f"rectangle (at most {MAX_DESIGNATE_CELLS} cells): mine (rock), harvest (ripe plants) "
     "or hunt (wild animals; dangerous ones can fight back).\n"
+    f"build_wall places a straight run of walls from x1,z1 to x2,z2 (one row or one "
+    f"column, at most {MAX_WALL_RUN} cells) in one action, skipping any cell that is "
+    "taken and telling you which. A room is four runs and a door: walls along each "
+    "side, then place_blueprint Door in a gap. build_floor lays flooring over a "
+    f"rectangle (at most {MAX_FLOOR_CELLS} cells).\n"
     "place_blueprint places one building from the buildable list at x,z, with rotation "
     "0 north, 1 east, 2 south or 3 west, and a stuff material if the building lists "
     "any. Colonists then build it while time runs, if one has Construction enabled "
@@ -191,6 +204,8 @@ def describe_colonist(c: Colonist) -> str:
 
 TICKS_PER_HOUR = 2500      # RimWorld: 60,000 ticks per in-game day
 TICKS_PER_SECOND = 60      # at speed 1; speed 2 is 3x that, speed 3 is 6x
+PAUSED_NUDGE_AFTER = 4     # paused decisions before the prompt says so loudly
+PAUSED_NUDGE_AFTER = 4     # paused decisions before the prompt says so loudly
 
 
 @dataclass
@@ -324,6 +339,12 @@ def describe_time(
         since = f"Since your last decision the game ran {window.seconds:g}s ({hours:.1f} in-game hours)"
         lines.append(since + (f" and stopped early: {window.stopped_by}." if window.stopped_by else "."))
     if mode.paused:
+        # Models will happily plan forever: one run stayed paused for 19
+        # decisions while the colonists stood still. Say it plainly.
+        if mode.paused_decisions >= PAUSED_NUDGE_AFTER:
+            lines.insert(0, f"NOTHING HAS HAPPENED FOR {mode.paused_decisions} DECISIONS. The "
+                            "colonists are standing still and none of your orders are being "
+                            "carried out. Choose resume to let them work.")
         count = (f" (Paused for {mode.paused_decisions} decision"
                  f"{'' if mode.paused_decisions == 1 else 's'}.)" if mode.paused_decisions else "")
         lines.append(
@@ -468,17 +489,24 @@ def describe_research(state: ResearchState) -> list[str]:
     return [now, f"Could start now: {choices}."]
 
 
+def blocked_by(check: object) -> bool:
+    """True when RIMAPI's area check found anything in the way."""
+    return bool(getattr(check, "terrain", []) or getattr(check, "ores", [])
+                or getattr(check, "buildings", []) or getattr(check, "zones", []))
+
+
 def describe_map(
     colonists: list[Colonist],
     terrain: TerrainMap,
     defs: GameDefs,
-    zones: list[Zone],
+    zones: list[TrackedZone],
     placements: list[str],
     finished_research: set[str],
     items: list[MapThing] | None = None,
     trees: list[MapThing] | None = None,
     blueprints: list[tuple[TrackedBlueprint, Status]] | None = None,
     buildings: list[Building] | None = None,
+    check_area: Callable[[Rect], object] | None = None,
 ) -> list[str]:
     """Everything the model needs to pick a place without reading the grid.
 
@@ -514,6 +542,11 @@ def describe_map(
             for cell in bp.area():
                 marks[cell] = blueprint_marks[status]
                 built_cells.add(cell)
+    zone_cells: set[tuple[int, int]] = set()
+    for zone in zones:
+        for cell in zone.area():
+            marks[cell] = GROWING if zone.kind == "growing" else STOCKPILE
+            zone_cells.add(cell)
     for c in colonists:
         if c.position:
             marks[(c.position.x, c.position.z)] = COLONIST
@@ -530,9 +563,11 @@ def describe_map(
     lines += ["", *overview_rows(anchor, terrain, defs.terrain, tree_cells, built_cells)]
     lines += ["", *detail_rows(view, terrain, defs.terrain, marks)]
 
-    spots = free_spots(anchor, terrain, defs.terrain, built_cells)
+    spots = free_spots(anchor, terrain, defs.terrain, built_cells | zone_cells)
+    if check_area:
+        spots = [s for s in spots if not blocked_by(check_area(s[1]))]
     if spots:
-        lines += ["", "Free spots near the base, nothing in the way (use these coordinates):"]
+        lines += ["", "Free spots near the base, checked just now (use these coordinates):"]
         lines += [f"  {letter}: {rect} - {note}" for letter, rect, note in spots]
 
     lines += ["", *describe_supplies([i for i in items or [] if view.contains(i.position.x, i.position.z)])]
@@ -566,7 +601,7 @@ def describe_map(
         lines.append("Nothing on the map is forbidden, so allow_items has nothing to do.")
     lines.append(f"Trees in the detail view: {sum(1 for cell in tree_cells if view.contains(*cell))}.")
 
-    lines += ["", "Zones: " + (", ".join(f"{z.label} ({z.type}, {z.cells_count} cells)" for z in zones) or "none") + "."]
+    lines += ["", "Your zones: " + ("; ".join(z.describe() for z in zones) or "none") + "."]
     lines.append("Placed by you: " + ("; ".join(placements) or "nothing yet") + ".")
 
     done = [b for b in buildings or [] if not b.under_construction]
@@ -793,6 +828,8 @@ def run(
             *require_work_change(cols, d.colonist, d.work_type, enable=False)
         ),
         "set_research": lambda d, cols: client.set_research(d.project),
+        "build_wall": lambda d, cols: client.build_wall(d.rect(), d.stuff),
+        "build_floor": lambda d, cols: client.build_floor(d.rect(), d.terrain),
         "set_bill": set_bill,
         # Map actions return the zone id or covered cells, for describe_placement.
         "create_growing_zone": lambda d, cols: client.create_growing_zone(d.plant, d.rect()),
@@ -806,6 +843,8 @@ def run(
     }
     # Blueprints are tracked separately (see BlueprintTracker), with live status.
     map_actions = (
+        "build_wall",
+        "build_floor",
         "create_growing_zone",
         "create_stockpile",
         "designate",
@@ -820,6 +859,7 @@ def run(
     if memory is None:
         memory = AgentMemory()
     blueprints = BlueprintTracker(memory.memory_dir / "blueprints.json")
+    zones_made = ZoneTracker(memory.memory_dir / "zones.json")
     window: TimeWindow | None = None  # what happened while time last ran
     carried_events: list[GameEvent] = []  # letters/messages that arrived while time ran
     last_results: list[str] = []  # what the previous turn's actions actually did
@@ -847,13 +887,14 @@ def run(
                     colonists,
                     client.get_terrain(),
                     client.get_game_defs(),
-                    client.get_zones(),
+                    zones_made.items,
                     placements,
                     client.get_finished_research(),
                     client.get_items(),
                     trees,
                     blueprint_report,
                     client.get_buildings(),
+                    client.check_area,
                 )
             except (RimApiError, httpx.TimeoutException) as e:
                 print(f"Step {step}: could not read game state: {e}")
@@ -908,6 +949,10 @@ def run(
                     error, any_failed = str(e), True
                     print(f"Step {step}: failed to {decision.action}: {e}")
 
+                if error is None and decision.action == "create_growing_zone":
+                    zones_made.add("growing", result, f"{decision.plant} field", decision.rect())
+                elif error is None and decision.action == "create_stockpile":
+                    zones_made.add("stockpile", result, "stockpile", decision.rect())
                 if error is None and decision.action == "place_blueprint":
                     blueprints.add(
                         decision.building_def, decision.stuff, decision.x, decision.z,

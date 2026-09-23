@@ -17,6 +17,9 @@ from rimagent.construction import (
     BUILDINGS,
     CROPS,
     DESIGNATIONS,
+    FLOORS,
+    MAX_FLOOR_CELLS,
+    MAX_WALL_RUN,
     MAX_CHOP_TREES,
     MAX_DESIGNATE_CELLS,
     MAX_ZONE_CELLS,
@@ -206,6 +209,13 @@ class AreaCheck(BaseModel):
     ores: list[AreaIssue] = Field(default_factory=list)       # rock and ore to mine first
     buildings: list[AreaIssue] = Field(default_factory=list)
     zones: list[AreaIssue] = Field(default_factory=list)      # one entry per overlapping zone
+
+    @staticmethod
+    def describe_cells(blocked: dict[tuple[int, int], str], limit: int = 3) -> str:
+        """Cells that stopped a wall or floor, e.g. "granite at (4,5)"."""
+        shown = ", ".join(f"{why} at ({x},{z})" for (x, z), why in list(blocked.items())[:limit])
+        more = f" and {len(blocked) - limit} more" if len(blocked) > limit else ""
+        return shown + more
 
     @staticmethod
     def describe(issues: list[AreaIssue], limit: int = 3) -> str:
@@ -747,6 +757,94 @@ class RimApiClient:
             },
         )
         return area
+
+    def _blocked_cells(self, rect: Rect, map_id: int) -> dict[tuple[int, int], str]:
+        """Cells in a rectangle that can't be built on, and why.
+
+        Combines RIMAPI's area check (rock, buildings, growing zones, terrain)
+        with a per-cell look for blueprints and frames, which the area check
+        cannot see.
+        """
+        check = self.check_area(rect, map_id)
+        blocked: dict[tuple[int, int], str] = {}
+        for issue in check.terrain + check.ores + check.buildings:
+            blocked[(issue.x, issue.z)] = issue.label or issue.def_name or "something"
+        for issue in check.zones:
+            if issue.zone_type != "Stockpile":  # building inside a stockpile is fine
+                blocked[(issue.x, issue.z)] = f"{issue.label or 'a zone'} (zone)"
+        for x, z in rect:
+            for thing in self.get_things_at(x, z, map_id):
+                if thing.def_name.startswith(("Blueprint_", "Frame_")):
+                    planned = thing.def_name.split("_", 1)[1]
+                    blocked[(x, z)] = f"{planned} already planned here"
+        return blocked
+
+    def build_wall(self, rect: Rect, stuff: str, def_name: str = "Wall", map_id: int = 0) -> str:
+        """Blueprint a straight run of walls, skipping cells that are taken.
+
+        Placing a wall one action at a time made models collide with their own
+        placements; a run is one action. Returns a summary for the next prompt.
+        """
+        spec = BUILDINGS.get(def_name)
+        if spec is None or spec.size != (1, 1):
+            raise ValueError(f"{def_name!r} cannot be built as a run; use place_blueprint")
+        if rect.x1 != rect.x2 and rect.z1 != rect.z2:
+            raise ValueError(f"a wall run must be straight: {rect} bends")
+        if rect.cells > MAX_WALL_RUN:
+            raise ValueError(f"{rect} is {rect.cells} cells; a run is at most {MAX_WALL_RUN}")
+        materials = spec.materials()
+        if stuff not in materials:
+            raise ValueError(f"{def_name} needs a material, one of: {', '.join(materials)}")
+        _check_rect(rect, self.get_terrain(map_id), MAX_WALL_RUN)
+
+        blocked = self._blocked_cells(rect, map_id)
+        free = [cell for cell in rect if cell not in blocked]
+        if not free:
+            raise ValueError(f"every cell in {rect} is taken: {AreaCheck.describe_cells(blocked)}")
+        self._request("POST", "/api/v1/builder/blueprint", json={
+            "map_id": map_id,
+            "position": {"x": rect.x1, "y": 0, "z": rect.z1},
+            "blueprint": {
+                "width": rect.x2 - rect.x1 + 1, "height": rect.z2 - rect.z1 + 1, "floors": [],
+                "buildings": [{"def_name": def_name, "stuff_def_name": stuff,
+                               "rel_x": x - rect.x1, "rel_z": z - rect.z1, "rotation": 0}
+                              for x, z in free],
+            },
+            "clear_obstacles": False,
+        })
+        skipped = (f"; skipped {len(blocked)} cells: {AreaCheck.describe_cells(blocked)}"
+                   if blocked else "")
+        return f"{len(free)} {def_name} blueprints from ({rect.x1},{rect.z1}) to ({rect.x2},{rect.z2}){skipped}"
+
+    def build_floor(self, rect: Rect, terrain: str, map_id: int = 0) -> str:
+        """Blueprint flooring over a rectangle, skipping cells that are taken."""
+        floor = FLOORS.get(terrain)
+        if floor is None:
+            raise ValueError(f"{terrain!r} is not a floor; choose from {', '.join(FLOORS)}")
+        if floor.research and floor.research not in self.get_finished_research():
+            raise ValueError(f"{terrain} needs the {floor.research} research first")
+        if rect.cells > MAX_FLOOR_CELLS:
+            raise ValueError(f"{rect} is {rect.cells} cells; floors cover at most {MAX_FLOOR_CELLS}")
+        _check_rect(rect, self.get_terrain(map_id), MAX_FLOOR_CELLS)
+
+        # Floors go under buildings, so only rock and unbuildable ground stop them.
+        check = self.check_area(rect, map_id)
+        blocked = {(i.x, i.z): i.label or i.def_name or "something"
+                   for i in check.terrain + check.ores}
+        free = [cell for cell in rect if cell not in blocked]
+        if not free:
+            raise ValueError(f"no cell in {rect} can take a floor: {AreaCheck.describe_cells(blocked)}")
+        self._request("POST", "/api/v1/builder/blueprint", json={
+            "map_id": map_id,
+            "position": {"x": rect.x1, "y": 0, "z": rect.z1},
+            "blueprint": {
+                "width": rect.x2 - rect.x1 + 1, "height": rect.z2 - rect.z1 + 1, "buildings": [],
+                "floors": [{"def_name": terrain, "rel_x": x - rect.x1, "rel_z": z - rect.z1}
+                           for x, z in free],
+            },
+            "clear_obstacles": False,
+        })
+        return f"{len(free)} cells of {floor.label} planned over {rect}"
 
     def designate(
         self, kind: Literal["mine", "harvest", "hunt"], rect: Rect, map_id: int = 0

@@ -95,6 +95,18 @@ class ChopTrees(RectAction):
     action: Literal["chop_trees"]
 
 
+class BuildWall(RectAction):
+    """A straight run of walls, so a room is four actions instead of a dozen."""
+
+    action: Literal["build_wall"]
+    stuff: str
+
+
+class BuildFloor(RectAction):
+    action: Literal["build_floor"]
+    terrain: str  # floor def name, e.g. "WoodPlankFloor"
+
+
 class SetResearch(BaseAction):
     action: Literal["set_research"]
     project: str  # def name from the available list, e.g. "Brewing"
@@ -113,6 +125,7 @@ Action = Annotated[
     Union[
         Wait, Pause, Resume, EnableWork, DisableWork, SetBill, SetResearch,
         CreateGrowingZone, CreateStockpile, PlaceBlueprint, Designate,
+        BuildWall, BuildFloor,
         AllowItems, ChopTrees,
     ],
     Field(discriminator="action"),

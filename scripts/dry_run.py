@@ -25,6 +25,7 @@ from rimagent.agent import (
     describe_time,
 )
 from rimagent.blueprints import BlueprintTracker
+from rimagent.zones import ZoneTracker
 from rimagent.memory import AgentMemory
 from rimagent.ollama_model import OllamaModel, parse_think
 from rimagent.rimapi import RimApiClient
@@ -43,10 +44,12 @@ def live_prompt(client: RimApiClient) -> str:
     state, colonists = client.get_state(), client.get_colonists()
     memory = AgentMemory()
     blueprints = BlueprintTracker(memory.memory_dir / "blueprints.json")
+    zones = ZoneTracker(memory.memory_dir / "zones.json")
     map_lines = describe_map(
-        colonists, client.get_terrain(), client.get_game_defs(), client.get_zones(), [],
+        colonists, client.get_terrain(), client.get_game_defs(), zones.items, [],
         client.get_finished_research(), client.get_items(), client.get_trees(),
         blueprints.check(client, forget_finished=False), client.get_buildings(),
+        client.check_area,
     )
     return build_prompt(
         state, colonists, client.get_alerts(), client.get_threats(), [], client.get_work_types(),

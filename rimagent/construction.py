@@ -13,7 +13,9 @@ from dataclasses import dataclass
 # Largest rectangle the agent may turn into one zone, and may designate at once.
 MAX_ZONE_CELLS = 15 * 15
 MAX_DESIGNATE_CELLS = 20 * 20
-MAX_CHOP_TREES = 30  # trees marked by one chop_trees action
+MAX_CHOP_TREES = 30       # trees marked by one chop_trees action
+MAX_WALL_RUN = 20         # cells in one straight wall run
+MAX_FLOOR_CELLS = 15 * 15  # cells floored by one action
 
 
 def is_tree(def_name: str) -> bool:
@@ -85,6 +87,24 @@ BUILDINGS = {
     "HorseshoesPin": BuildSpec("horseshoes pin", stuff=("Metallic", "Woody", "Stony"), stuff_count=10),
     "ChessTable": BuildSpec("chess table", stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture", stuff_count=70),
 }
+
+@dataclass(frozen=True)
+class FloorSpec:
+    label: str
+    cost: tuple[str, int]        # material and how much per cell
+    research: str | None = None
+
+
+# Floors the agent may lay. Costs are per cell, from RimWorld 1.6's def files.
+FLOORS = {
+    "WoodPlankFloor": FloorSpec("wood floor", ("WoodLog", 3)),
+    "TileSandstone": FloorSpec("sandstone tile", ("BlocksSandstone", 4), research="Stonecutting"),
+    "TileGranite": FloorSpec("granite tile", ("BlocksGranite", 4), research="Stonecutting"),
+    "TileLimestone": FloorSpec("limestone tile", ("BlocksLimestone", 4), research="Stonecutting"),
+    "TileSlate": FloorSpec("slate tile", ("BlocksSlate", 4), research="Stonecutting"),
+    "TileMarble": FloorSpec("marble tile", ("BlocksMarble", 4), research="Stonecutting"),
+}
+
 
 # Food and fibre crops that need no research. Drug and medicine crops are left
 # out on purpose.
