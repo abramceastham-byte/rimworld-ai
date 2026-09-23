@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from rimagent.choices import incapable_work
 from rimagent.construction import BUILDINGS, FLOORS, Rect, footprint
+from rimagent.observation import PLENTY_OF_STORAGE
 from rimagent.rooms import NEXT, inside_of
 from rimagent.supplies import commitments, how_to_get, stock_by_def
 
@@ -34,6 +35,8 @@ class TurnFacts:
     buildings: list = field(default_factory=list)
     colonists: list = field(default_factory=list)
     anchor: tuple[int, int] | None = None           # middle of the base
+    storage: dict | None = None                     # /resources/storages/summary
+    rooms: list = field(default_factory=list)       # TrackedRoom, from rooms.RoomTracker
     learned: dict = field(default_factory=dict)     # work RIMAPI refused, by colonist
 
     def unfinished(self, def_name: str | None = None) -> list:
@@ -127,10 +130,29 @@ def storage_hint(storage: dict | None, shelf_buildable: bool) -> str | None:
         return None
     text = (f"HINT: Storage is {'full' if used >= total else 'nearly full'} ({used}/{total} cells used in "
             f"{storage.get('total_stockpiles', '?')} stockpiles): new items stay where they fall, and outdoors "
-            "they deteriorate. Make room: create_stockpile on open ground (indoors keeps things longest)")
-    return text + ("; or place_blueprint Shelf (2x1) inside a stockpile or room: a shelf stores several stacks "
-                   "per cell, so it holds more in less space." if shelf_buildable else
+            "they deteriorate. Best: a storage room (build_room purpose storage), then create_stockpile over "
+            "its inside")
+    return text + ("; place_blueprint Shelf (2x1) inside it: a shelf stores several stacks per cell, so the room "
+                   "holds more in less space. A stockpile on open ground works too, but items there weather."
+                   if shelf_buildable else
                    "; shelves hold more in less space once ComplexFurniture is researched.")
+
+
+def stockpile_refusal(action, facts: TurnFacts) -> str | None:
+    """Refuse a new stockpile while storage has plenty of room, unless it is the
+    inside of a storage room: more open-air stockpiles only spread items out."""
+    if action.action != "create_stockpile" or not facts.storage:
+        return None
+    used, total = facts.storage.get("used_cells", 0), facts.storage.get("total_cells", 0)
+    if not total or used >= PLENTY_OF_STORAGE * total:
+        return None
+    rect = action.rect()
+    for room in facts.rooms:
+        if room.purpose == "storage" and inside_of(room.area()).contains(rect.x1, rect.z1) \
+                and inside_of(room.area()).contains(rect.x2, rect.z2):
+            return None
+    return (f"storage already has plenty of room ({used}/{total} cells used), so no new stockpile outside a "
+            "storage room")
 
 
 def pending_work(facts: TurnFacts, research, tables, live_zones, chop_orders: int,
@@ -240,6 +262,10 @@ def failure_hint(action, error: str, facts: TurnFacts) -> tuple[str, bool]:
     if kind == "create_growing_zone":
         fertile = [f"{letter} {rect}" for letter, rect, note in facts.spots if "fertile" in note]
         return ("Fertile free spots this turn: " + ("; ".join(fertile) or "none") + ".", False)
+    if kind == "create_stockpile" and "plenty of room" in error:
+        return ("Nothing to do: there's room to spare. For better storage, build_room with purpose storage, "
+                "place Shelf blueprints inside, and create_stockpile over its inside (that is always allowed).",
+                False)
     if kind == "create_stockpile":
         return f"Free spots this turn: {spot_list(facts) or 'none'}.", False
     return "", True

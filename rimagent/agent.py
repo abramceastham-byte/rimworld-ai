@@ -13,8 +13,8 @@ from rimagent.actions import Turn
 from rimagent.blueprints import BlueprintTracker, Status, TrackedBlueprint
 from rimagent.choices import Choices, FailureMemory, incapable_work
 from rimagent.chopping import ChopTracker
-from rimagent.hints import (IdleTracker, TurnFacts, failure_hint, idle_hint, pending_work, storage_hint,
-                            success_hint)
+from rimagent.hints import (IdleTracker, TurnFacts, failure_hint, idle_hint, pending_work, stockpile_refusal,
+                            storage_hint, success_hint)
 from rimagent.rooms import RoomTracker
 from rimagent.construction import (
     BUILDINGS,
@@ -102,7 +102,9 @@ Fields (inclusive rectangles use x1,z1,x2,z2; x east, z north):
 - set_research: project (available name); no bills on research benches.
 - create_growing_zone: plant, rectangle (<=225 cells), in the open: never inside a room or where you
   mean to build one, since a closed room is roofed and crops need sunlight.
-- create_stockpile: rectangle (<=225); normal priority, accepts normal items.
+- create_stockpile: rectangle (<=225); normal priority, accepts normal items. While storage is under
+  half full it is refused except inside a room built with purpose storage: prefer a storage room with
+  Shelf blueprints to more open-air stockpiles.
 - place_blueprint: building_def, x,z, rotation (0=N,1=E,2=S,3=W), stuff.
   x,z is RimWorld's anchor, not always a corner; use checked candidates. Fixed-cost buildings: stuff=null.
 - build_room: OUTER rectangle including the walls (4..15 cells per side; inside is 2 smaller each way,
@@ -852,7 +854,8 @@ def prepare_turn(client, memory, blueprints, zones, mode, window=None,
                              {z.label: z.cells_count for z in live_zones})
     facts = TurnFacts(spots=found.get("spots", []), targets=operations.targets, trees=trees, items=items,
                       stored=stored, report=report, buildings=buildings, colonists=colonists,
-                      anchor=found.get("anchor"), learned=learned_incapable or {})
+                      anchor=found.get("anchor"), learned=learned_incapable or {},
+                      storage=operations.storage, rooms=list(rooms.items) if rooms is not None else [])
     if rooms is not None and rooms.items:
         map_lines += ["", "Your rooms (purpose as you tagged it):",
                       *(rooms.describe(*room_state(buildings, report)) or ["none standing any more"])]
@@ -986,6 +989,9 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
                     # Every order is tried, even after a failure: the game refuses
                     # one that relied on it, and the report says which worked.
                     try:
+                        refusal = stockpile_refusal(action, context['facts'])
+                        if refusal:
+                            raise ValueError(refusal)
                         result = execute(client, action, blueprints, zones, context['operations'],
                                          learned_incapable, chops)
                         if action.action == "build_room" and not result.startswith("unchanged"):

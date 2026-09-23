@@ -25,22 +25,34 @@ def read_operations(client, colonists, defs, map_id=0):
             return None
 
     weather = get("map/weather")
+    temperature = weather.get("temperature") if weather else None
     if weather:
-        temperature = weather.get("temperature")
         shown = f"{temperature:.0f}" if isinstance(temperature, (int, float)) else "?"
-        result.lines.append(f"Outdoors: {shown} C, {weather.get('weather', '?')}. "
-                            "Crops grow only in suitable temperatures, not just on fertile soil.")
+        result.lines.append(f"Outdoors: {shown} C, {weather.get('weather', '?')}.")
     date = get("datetime")
     if date:
         result.lines.append("Date: " + date.get("datetime", "unknown"))
     farm = get("map/farm/summary")
+    zones = (get("map/zones") or {}).get("zones") or []
+    if isinstance(temperature, (int, float)):
+        result.lines.append(growing_season(temperature))
+    fields = [z for z in zones if "Growing" in (z.get("type") or "")]
+    if colonists:
+        result.lines.append(field_advice(sum(z.get("cells_count", 0) for z in fields), len(colonists)))
     if farm:
-        result.lines.append(f"Farms: {farm.get('total_growing_zones', 0)} zones, "
+        result.lines.append(f"Farms: {farm.get('total_growing_zones', 0)} growing zones, "
+                            f"{sum(z.get('cells_count', 0) for z in fields)} cells in all, "
                             f"{farm.get('total_plants', 0)} plants, "
                             f"{farm.get('total_infected_plants', 0)} infected.")
+        crops = [c["plant_def_name"] for c in farm.get("crop_types", [])]
         for crop in farm.get("crop_types", []):
             name = crop["plant_def_name"]
             result.lines.append(describe_crop(crop, defs.plants.get(name, {})))
+        # RIMAPI can't give a field's cells or its own growth (its per-zone
+        # endpoint reads map_id as the zone id), so fields are found from
+        # where each crop's plants stand.
+        for crop, area, count in fields_from_plants(client.get_plants(map_id), crops):
+            result.lines.append(f"Field of {crop} around {area}: {count} plants.")
             if crop.get("harvestable_plants", 0):
                 # Plant rows carry no growth, so these are the crop's cells;
                 # the harvest designation itself only takes ripe plants.
@@ -50,7 +62,7 @@ def read_operations(client, colonists, defs, map_id=0):
     storage = get("resources/storages/summary")
     result.storage = storage
     if storage:
-        result.lines.append(f"Storage: {storage.get('used_cells', 0)}/{storage.get('total_cells', 0)} cells used.")
+        result.lines.append(describe_storage(storage, [z for z in zones if "Stockpile" in (z.get("type") or "")]))
     power = get("map/power/info")
     if power:
         makers = len(power.get("produce_power_buildings") or [])
@@ -123,6 +135,74 @@ def read_operations(client, colonists, defs, map_id=0):
             result.lines.append(f"Nearest {kind} targets: " + "; ".join(describe_target(kind, t)
                                                                       for t in shown) + ".")
     return result
+
+
+# RimWorld plant growth by temperature: full speed from 10 to 42 C, slowing
+# to nothing at 0 C and at 58 C (Plant.GrowthRateFactor_Temperature).
+GROW_MIN, GROW_FULL_LOW, GROW_FULL_HIGH, GROW_MAX = 0, 10, 42, 58
+PLENTY_OF_STORAGE = 0.5  # under this share used, another stockpile isn't needed
+FIELD_CELLS_PER_COLONIST = 10  # a recommendation shown to the model, never enforced
+
+
+def field_advice(field_cells: int, colonists: int) -> str:
+    """How much growing area there is against the recommended amount."""
+    target = FIELD_CELLS_PER_COLONIST * colonists
+    text = (f"Recommended growing area: about {FIELD_CELLS_PER_COLONIST} cells per colonist, {target} for "
+            f"{colonists}; you have {field_cells}")
+    if field_cells < target:
+        return text + f", so a field of about {target - field_cells} more cells would help."
+    return text + ", which is enough; more fields are optional."
+
+
+def growing_season(temperature: float) -> str:
+    """Whether outdoor crops grow right now, and how fast."""
+    if temperature <= GROW_MIN or temperature >= GROW_MAX:
+        return (f"Growing season: NO, at {temperature:.0f} C outdoor crops don't grow at all; don't sow "
+                "outdoors until it is between 0 and 58 C.")
+    if GROW_FULL_LOW <= temperature <= GROW_FULL_HIGH:
+        return f"Growing season: yes, crops grow at full speed at {temperature:.0f} C (10 to 42 C)."
+    if temperature < GROW_FULL_LOW:
+        rate = (temperature - GROW_MIN) / (GROW_FULL_LOW - GROW_MIN)
+    else:
+        rate = (GROW_MAX - temperature) / (GROW_MAX - GROW_FULL_HIGH)
+    return (f"Growing season: yes but slow, crops grow at about {rate:.0%} speed at {temperature:.0f} C "
+            "(full speed from 10 to 42 C).")
+
+
+def fields_from_plants(plants: list[dict], crops: list[str], gap: int = 2):
+    """(crop, bounding Rect, plant count) for each group of a sown crop's plants.
+
+    Plants of the same crop within gap cells of each other belong to one field.
+    """
+    from rimagent.construction import Rect
+    found = []
+    for crop in crops:
+        cells = {(p["position"]["x"], p["position"]["z"]) for p in plants if p.get("def_name") == crop}
+        while cells:
+            group, todo = set(), [cells.pop()]
+            while todo:
+                x, z = todo.pop()
+                group.add((x, z))
+                near = {(x + dx, z + dz) for dx in range(-gap, gap + 1) for dz in range(-gap, gap + 1)} & cells
+                cells -= near
+                todo.extend(near)
+            xs, zs = [x for x, _ in group], [z for _, z in group]
+            found.append((crop, Rect(min(xs), min(zs), max(xs), max(zs)), len(group)))
+    return sorted(found, key=lambda f: -f[2])
+
+
+def describe_storage(storage: dict, stockpiles: list[dict]) -> str:
+    """How much storage there is, per stockpile, and whether more is needed."""
+    used, total = storage.get("used_cells", 0), storage.get("total_cells", 0)
+    if not total:
+        return ("Storage: no stockpiles yet, so items lie where they fall and outdoors they deteriorate: a "
+                "storage room (build_room purpose storage) with a stockpile over its inside is best.")
+    sizes = ", ".join(f"{z.get('label', '?')} {z.get('cells_count', 0)} cells" for z in stockpiles)
+    text = f"Storage: {used}/{total} cells used" + (f" across {len(stockpiles)} stockpiles ({sizes})" if sizes else "")
+    if total and used < PLENTY_OF_STORAGE * total:
+        return text + (f". {total - used} cells free: plenty of room, so don't create another stockpile; "
+                       "for better storage, build a storage room with shelves.")
+    return text + "."
 
 
 def describe_crop(crop: dict, plant_def: dict) -> str:

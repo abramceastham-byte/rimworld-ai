@@ -39,7 +39,7 @@ NEXT = {
     "kitchen": "place a FueledStove inside (and a TableButcher nearby for meat)",
     "dining": "place a Table2x2c and DiningChairs inside",
     "workshop": "place work tables inside",
-    "storage": "create_stockpile over the inside",
+    "storage": "create_stockpile over the inside, then Shelf blueprints along the walls",
     "other": "furnish it as you intended",
 }
 
