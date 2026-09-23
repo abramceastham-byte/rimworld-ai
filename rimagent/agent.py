@@ -916,8 +916,9 @@ def run(
                     decision.action,
                     decision.reason,
                     error,
-                    decision.colonist,
-                    decision.work_type,
+                    # Only the work actions carry these.
+                    getattr(decision, "colonist", None),
+                    getattr(decision, "work_type", None),
                 )
                 print(f"Step {step}.{index}: {decision.action} ({decision.reason})")
                 logger.log_decision(
