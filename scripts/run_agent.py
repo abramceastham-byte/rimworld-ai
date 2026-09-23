@@ -16,7 +16,7 @@ import argparse
 
 import httpx
 
-from rimagent.agent import Turn, run
+from rimagent.agent import TICKS_PER_SECOND, Turn, run
 from rimagent.events import EventListener
 from rimagent.fake_model import make_fake_model
 from rimagent.ollama_model import OllamaModel, parse_think
@@ -30,9 +30,10 @@ def main() -> None:
     parser.add_argument("--think", help="on/off (qwen3) or low/medium/high (gpt-oss). Default: the model's own.")
     parser.add_argument("--steps", type=int, help="Decisions to make (default: 3 fake, 10 real).")
     parser.add_argument("--run-seconds", type=float, default=10.0,
-                        help="How long the game runs after each decision (default 10).")
+                        help="Game time per decision, in seconds at normal speed (default 10). "
+                             "Higher --speed makes the real wait shorter, not the colony time.")
     parser.add_argument("--threat-run-seconds", type=float, default=3.0,
-                        help="How long it runs while a threat is active (default 3).")
+                        help="Game time per decision while a threat is active (default 3).")
     parser.add_argument("--speed", type=int, choices=(1, 2, 3), default=1,
                         help="Game speed while running: 1 normal, 2 fast, 3 superfast.")
     parser.add_argument("--num-ctx", type=int, default=16384, help="Model context window in tokens.")
@@ -72,7 +73,8 @@ def main() -> None:
             with EventListener() as events:
                 run(
                     client, model, logger, events, max_steps=steps,
-                    run_seconds=args.run_seconds, threat_run_seconds=args.threat_run_seconds,
+                    run_ticks=round(args.run_seconds * TICKS_PER_SECOND),
+                    threat_run_ticks=round(args.threat_run_seconds * TICKS_PER_SECOND),
                     speed=args.speed,
                 )
         except KeyboardInterrupt:

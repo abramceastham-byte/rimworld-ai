@@ -63,10 +63,9 @@ def letter(category: str, text: str) -> GameEvent:
 class LetTimeRunTests(unittest.TestCase):
     def test_runs_for_the_full_time_then_pauses(self) -> None:
         game = FakeGame()
-        window = let_time_run(game, None, seconds=0.3, speed=2, poll_seconds=0.05)
+        window = let_time_run(game, None, ticks=180, speed=2, poll_seconds=0.02)
         self.assertIsNone(window.stopped_by)
-        self.assertGreaterEqual(window.seconds, 0.3)
-        self.assertGreater(window.ticks, 0)
+        self.assertGreaterEqual(window.ticks, 180)  # ran the game time asked for
         self.assertEqual(game.calls[0], "resume(2)")
         self.assertEqual(game.calls[-1], "pause")
         self.assertTrue(game.paused)
@@ -74,7 +73,7 @@ class LetTimeRunTests(unittest.TestCase):
     def test_a_threat_letter_stops_it_early(self) -> None:
         game = FakeGame()
         events = FakeEvents([[], [letter("NeutralEvent", "Trader")], [letter("ThreatBig", "Raid")]])
-        window = let_time_run(game, events, seconds=5, poll_seconds=0.02)
+        window = let_time_run(game, events, ticks=6000, poll_seconds=0.02)
         self.assertIn("Raid", window.stopped_by)
         self.assertLess(window.seconds, 1)
         self.assertEqual([e.text for e in window.events], ["Trader", "Raid"])  # kept for the prompt
@@ -84,13 +83,13 @@ class LetTimeRunTests(unittest.TestCase):
     def test_a_threat_the_game_paused_for(self) -> None:
         game = FakeGame(pause_itself_after_checks=3)  # auto-pauses as the letter arrives
         events = FakeEvents([[], [], [letter("ThreatBig", "Raid")]])
-        window = let_time_run(game, events, seconds=5, poll_seconds=0.02)
+        window = let_time_run(game, events, ticks=6000, poll_seconds=0.02)
         self.assertTrue(window.game_paused)
         self.assertIn("paused itself for a threat (letter: Raid)", window.stopped_by)
 
     def test_the_game_pausing_itself_stops_it_early(self) -> None:
         game = FakeGame(pause_itself_after_checks=3)
-        window = let_time_run(game, FakeEvents([]), seconds=5, poll_seconds=0.02)
+        window = let_time_run(game, FakeEvents([]), ticks=6000, poll_seconds=0.02)
         self.assertTrue(window.game_paused)
         self.assertIn("by RimWorld or the player", window.stopped_by)
         self.assertLess(window.seconds, 1)
@@ -130,24 +129,24 @@ class TimeModeTests(unittest.TestCase):
 
 class DescribeTimeTests(unittest.TestCase):
     def test_running(self) -> None:
-        text = describe_time(TimeMode(paused=False), None, 10, 3)
+        text = describe_time(TimeMode(paused=False), None, 600, 180)
         self.assertIn("Time is running", text)
-        self.assertIn("runs for 10s (3s while a threat is active)", text)
+        self.assertIn("runs for 0.2 in-game hours (0.1 while a threat is active)", text)
         self.assertIn("choose pause to stop time", text)
 
     def test_paused_invites_planning(self) -> None:
-        text = describe_time(TimeMode(True, "you paused it", 0), None, 10, 3)
+        text = describe_time(TimeMode(True, "you paused it", 0), None, 600, 180)
         self.assertIn("The game is paused (you paused it). This is a good time to plan", text)
         self.assertIn("start on it all once you resume", text)
         self.assertNotIn("Paused for", text)  # no count on the first paused decision
 
     def test_paused_count(self) -> None:
-        self.assertIn("(Paused for 1 decision.)", describe_time(TimeMode(True, "x", 1), None, 10, 3))
-        self.assertIn("(Paused for 6 decisions.)", describe_time(TimeMode(True, "x", 6), None, 10, 3))
+        self.assertIn("(Paused for 1 decision.)", describe_time(TimeMode(True, "x", 1), None, 600, 180))
+        self.assertIn("(Paused for 6 decisions.)", describe_time(TimeMode(True, "x", 6), None, 600, 180))
 
     def test_says_what_happened_while_time_ran(self) -> None:
         window = TimeWindow(seconds=2.1, ticks=1250, stopped_by="a threat arrived (letter: Raid)")
-        text = describe_time(TimeMode(paused=False), window, 10, 3)
+        text = describe_time(TimeMode(paused=False), window, 600, 180)
         self.assertIn("ran 2.1s (0.5 in-game hours) and stopped early: a threat arrived", text)
 
 

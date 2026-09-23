@@ -189,7 +189,8 @@ def describe_colonist(c: Colonist) -> str:
     )
 
 
-TICKS_PER_HOUR = 2500  # RimWorld: 60,000 ticks per in-game day
+TICKS_PER_HOUR = 2500      # RimWorld: 60,000 ticks per in-game day
+TICKS_PER_SECOND = 60      # at speed 1; speed 2 is 3x that, speed 3 is 6x
 
 
 @dataclass
@@ -251,11 +252,15 @@ def mode_after_window(mode: TimeMode, window: TimeWindow) -> TimeMode:
 def let_time_run(
     client: RimApiClient,
     events: EventListener | None,
-    seconds: float,
+    ticks: int,
     speed: int = NORMAL,
-    poll_seconds: float = 1.0,
+    poll_seconds: float = 0.5,
 ) -> TimeWindow:
-    """Unpause for up to `seconds`, then pause again.
+    """Unpause until `ticks` of game time have passed, then pause again.
+
+    Measured in game ticks, not real seconds, so a decision covers the same
+    amount of colony time at any speed (RimWorld runs 60 ticks/s at speed 1,
+    180 at speed 2, 360 at speed 3): a faster speed just shortens the wait.
 
     Stops early, so the model can respond straight away, when a threat letter
     arrives or when the game pauses itself (RimWorld can auto-pause on major
@@ -267,17 +272,22 @@ def let_time_run(
     game_paused = False
     pause_reason = ""
     start = time.monotonic()
+    # However slow the game runs, never block a whole turn on it.
+    deadline = start + ticks / TICKS_PER_SECOND * 4 + 5
     client.resume(speed)
     try:
-        while (elapsed := time.monotonic() - start) < seconds:
-            time.sleep(min(poll_seconds, seconds - elapsed))
+        while time.monotonic() < deadline:
+            time.sleep(poll_seconds)
             new = events.drain() if events else []
             collected += new
             threat = next((e for e in new if e.category.startswith("Threat")), None)
             try:
-                paused = client.get_state().is_paused
+                state = client.get_state()
+                paused, passed = state.is_paused, state.game_tick - start_tick
             except (RimApiError, httpx.HTTPError):
-                paused = False  # a missed check is fine; try again next poll
+                paused, passed = False, 0  # a missed check is fine; try again
+            if passed >= ticks and not threat:
+                break
             if threat:
                 # RimWorld may have auto-paused for it at the same moment.
                 game_paused = paused
@@ -305,7 +315,7 @@ def let_time_run(
 
 
 def describe_time(
-    mode: TimeMode, window: TimeWindow | None, run_seconds: float, threat_run_seconds: float
+    mode: TimeMode, window: TimeWindow | None, run_ticks: int, threat_run_ticks: int
 ) -> str:
     """Whether time is running or paused, and what happened since the last decision."""
     lines = []
@@ -325,10 +335,11 @@ def describe_time(
         )
     else:
         lines.append(
-            f"Time is running: after this decision the game runs for {run_seconds:g}s "
-            f"({threat_run_seconds:g}s while a threat is active), then pauses for your next "
-            "decision. If there's a lot to set up, choose pause to stop time and give several "
-            "orders in a row."
+            f"Time is running: after this decision the game runs for "
+            f"{run_ticks / TICKS_PER_HOUR:.1f} in-game hours "
+            f"({threat_run_ticks / TICKS_PER_HOUR:.1f} while a threat is active), then pauses "
+            "for your next decision. If there's a lot to set up, choose pause to stop time and "
+            "give several orders in a row."
         )
     return "\n".join(lines)
 
@@ -746,8 +757,8 @@ def run(
     logger: RunLogger,
     events: EventListener | None = None,
     max_steps: int = 10,
-    run_seconds: float = 10.0,
-    threat_run_seconds: float = 3.0,
+    run_ticks: int = 10 * TICKS_PER_SECOND,        # game time per decision
+    threat_run_ticks: int = 3 * TICKS_PER_SECOND,  # less while a threat is active
     speed: int = NORMAL,
     memory: AgentMemory | None = None,
 ) -> None:
@@ -855,7 +866,7 @@ def run(
             for event in new_events:
                 logger.log_event(event)
 
-            time_status = describe_time(mode, window, run_seconds, threat_run_seconds)
+            time_status = describe_time(mode, window, run_ticks, threat_run_ticks)
             mode_at_decision = mode
             prompt = build_prompt(
                 state,
@@ -958,8 +969,8 @@ def run(
                 window = None
                 print(f"         game stays paused ({mode.reason})")
             else:
-                seconds = threat_run_seconds if danger_present else run_seconds
-                window = let_time_run(client, events, seconds, speed)
+                ticks = threat_run_ticks if danger_present else run_ticks
+                window = let_time_run(client, events, ticks, speed)
                 carried_events = window.events
                 mode = mode_after_window(mode, window)
                 note = f", stopped early: {window.stopped_by}" if window.stopped_by else ""

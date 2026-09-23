@@ -16,7 +16,14 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from rimagent.agent import TimeMode, Turn, build_prompt, describe_map, describe_time
+from rimagent.agent import (
+    TICKS_PER_SECOND,
+    TimeMode,
+    Turn,
+    build_prompt,
+    describe_map,
+    describe_time,
+)
 from rimagent.blueprints import BlueprintTracker
 from rimagent.memory import AgentMemory
 from rimagent.ollama_model import OllamaModel, parse_think
@@ -44,7 +51,8 @@ def live_prompt(client: RimApiClient) -> str:
     return build_prompt(
         state, colonists, client.get_alerts(), client.get_threats(), [], client.get_work_types(),
         client.get_work_tables(), client.get_research(),
-        describe_time(start_mode(state), None, 10, 3), memory,
+        describe_time(start_mode(state), None, 10 * TICKS_PER_SECOND, 3 * TICKS_PER_SECOND),
+        memory,
         map_lines,
     )
 

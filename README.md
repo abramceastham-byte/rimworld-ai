@@ -168,10 +168,14 @@ python -m scripts.run_agent --model qwen3:14b --think on --steps 20
 **Game time is controlled by the loop**, in two modes. The game is always paused
 while the model decides.
 
-- **Running:** after each action the game runs for `--run-seconds` (default 10),
-  or `--threat-run-seconds` (default 3) while a threat is active, then pauses for
-  the next decision. It stops early if a threat letter arrives or the game pauses
-  itself, so the model can respond at once.
+- **Running:** after each action the game runs for `--run-seconds` of *game*
+  time (default 10, measured at normal speed), or `--threat-run-seconds`
+  (default 3) while a threat is active, then pauses for the next decision. The
+  window is counted in game ticks, so `--speed` only changes how long you wait:
+  RimWorld runs 60 ticks/s at speed 1, 180 at speed 2 and 360 at speed 3, so
+  `--run-seconds 15 --speed 2` is a decision roughly every 5 real seconds. It
+  stops early if a threat letter arrives or the game pauses itself, so the model
+  can respond at once.
 - **Paused:** the model's `pause` action stops time until it chooses `resume`, so
   it can give several orders in a row (orders are queued and carried out when
   time runs again). The loop also switches to this mode when the game pauses
