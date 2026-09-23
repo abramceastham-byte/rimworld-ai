@@ -7,13 +7,8 @@ import unittest
 
 from pydantic import ValidationError
 
-from rimagent.agent import (
-    MAX_ACTIONS,
-    Turn,
-    describe_supplies,
-    honest_memory_update,
-    stock_by_def,
-)
+from rimagent.actions import MAX_ACTIONS, Turn
+from rimagent.agent import describe_supplies, honest_memory_update, stock_by_def
 from rimagent.memory import MemoryUpdate
 from rimagent.rimapi import Building, MapThing
 
@@ -61,6 +56,27 @@ class TurnTests(unittest.TestCase):
                 '{"actions": [{"action": "wait", "reason": "ok"}, '
                 '{"action": "set_bill", "reason": "no ids"}]}'
             )
+
+
+    def test_an_action_cannot_carry_another_actions_fields(self) -> None:
+        # The failure this schema exists to prevent: a zone sent with a
+        # blueprint's x/z instead of the rectangle x1/z1/x2/z2.
+        with self.assertRaises(ValidationError):
+            Turn.model_validate_json(
+                '{"actions": [{"action": "create_growing_zone", "plant": "Plant_Potato", '
+                '"x": 110, "z": 120, "rotation": 0, "stuff": null, "reason": "potatoes"}]}'
+            )
+        Turn.model_validate_json(
+            '{"actions": [{"action": "create_growing_zone", "plant": "Plant_Potato", '
+            '"x1": 110, "z1": 120, "x2": 113, "z2": 123, "reason": "potatoes"}]}'
+        )
+
+    def test_the_schema_tells_the_model_each_action_shape(self) -> None:
+        schema = Turn.model_json_schema()
+        zone = schema["$defs"]["CreateGrowingZone"]
+        self.assertEqual(set(zone["required"]), {"action", "reason", "plant", "x1", "z1", "x2", "z2"})
+        self.assertNotIn("x", zone["properties"])  # no blueprint fields to reach for
+        self.assertNotIn("stuff", zone["properties"])
 
 
 class HonestMemoryTests(unittest.TestCase):

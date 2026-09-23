@@ -7,7 +7,7 @@ import unittest
 
 from pydantic import ValidationError
 
-from rimagent.agent import Decision
+from rimagent.actions import CreateGrowingZone, Wait, CreateStockpile, Designate, PlaceBlueprint
 from rimagent.construction import Rect, TerrainMap, footprint
 from rimagent.rimapi import RimApiClient
 
@@ -326,14 +326,14 @@ class ChopTreesTests(MapTestCase):
 class DecisionTests(unittest.TestCase):
     def test_map_actions_need_their_fields(self) -> None:
         with self.assertRaises(ValidationError):
-            Decision(action="create_growing_zone", x1=1, z1=1, x2=3, z2=3)  # no plant
+            CreateGrowingZone(action="create_growing_zone", x1=1, z1=1, x2=3, z2=3, reason="x")
         with self.assertRaises(ValidationError):
-            Decision(action="place_blueprint", building_def="Bed", x=4)  # no z
+            PlaceBlueprint(action="place_blueprint", building_def="Bed", x=4, reason="x")
         with self.assertRaises(ValidationError):
-            Decision(action="designate", designation="deconstruct", x1=0, z1=0, x2=1, z2=1)
+            Designate(action="designate", designation="deconstruct", x1=0, z1=0, x2=1, z2=1, reason="x")
 
     def test_complete_map_action_parses(self) -> None:
-        decision = Decision.model_validate_json(
+        decision = CreateStockpile.model_validate_json(
             '{"action": "create_stockpile", "x1": 5, "z1": 9, "x2": 2, "z2": 3, '
             '"reason": "Store the supplies."}'
         )
@@ -341,10 +341,10 @@ class DecisionTests(unittest.TestCase):
 
     def test_reason_is_required(self) -> None:
         with self.assertRaises(ValidationError):
-            Decision.model_validate_json('{"action": "wait"}')
+            Wait.model_validate_json('{"action": "wait"}')
         with self.assertRaises(ValidationError):
-            Decision.model_validate_json('{"action": "wait", "reason": ""}')
-        self.assertIn("reason", Decision.model_json_schema()["required"])  # so Ollama enforces it
+            Wait.model_validate_json('{"action": "wait", "reason": ""}')
+        self.assertIn("reason", Wait.model_json_schema()["required"])  # so Ollama enforces it
 
 
 if __name__ == "__main__":

@@ -38,39 +38,52 @@ class BuildSpec:
     label: str
     size: tuple[int, int] = (1, 1)            # (width, depth) when facing north
     stuff: tuple[str, ...] = ()               # stuff categories; empty = fixed cost
+    stuff_count: int = 0                      # units of the chosen material
+    cost: tuple[tuple[str, int], ...] = ()    # fixed extra cost, e.g. (("Steel", 25),)
     research: str | None = None               # research project that unlocks it
 
     def materials(self) -> list[str]:
         return [m for category in self.stuff for m in STUFF_BY_CATEGORY.get(category, [])]
 
+    def cost_text(self) -> str:
+        """What it takes to build, e.g. "75 of WoodLog/Steel/stone blocks + 25 Steel"."""
+        parts = []
+        if self.stuff_count:
+            kinds = "/".join(
+                "stone blocks" if c == "Stony" else STUFF_BY_CATEGORY[c][0] for c in self.stuff
+            )
+            parts.append(f"{self.stuff_count} of {kinds}")
+        parts += [f"{count} {name}" for name, count in self.cost]
+        return " + ".join(parts) or "nothing"
+
 
 # An early-game building set the agent may place as blueprints.
 BUILDINGS = {
-    "Wall": BuildSpec("wall", stuff=("Metallic", "Woody", "Stony")),
-    "Door": BuildSpec("door", stuff=("Metallic", "Woody", "Stony")),
-    "SleepingSpot": BuildSpec("sleeping spot", size=(1, 2)),
-    "Bed": BuildSpec("bed", size=(1, 2), stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture"),
-    "DoubleBed": BuildSpec("double bed", size=(2, 2), stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture"),
-    "Campfire": BuildSpec("campfire"),
-    "TorchLamp": BuildSpec("torch lamp"),
-    "ButcherSpot": BuildSpec("butcher spot"),
-    "CraftingSpot": BuildSpec("crafting spot"),
-    "TableButcher": BuildSpec("butcher table", size=(3, 1), stuff=("Metallic", "Woody")),
-    "FueledStove": BuildSpec("fueled stove", size=(3, 1)),
-    "ElectricStove": BuildSpec("electric stove", size=(3, 1), research="Electricity"),
-    "SimpleResearchBench": BuildSpec("simple research bench", size=(3, 2), stuff=("Metallic", "Woody", "Stony")),
-    "HandTailoringBench": BuildSpec("hand tailoring bench", size=(3, 1), stuff=("Metallic", "Woody"), research="ComplexClothing"),
-    "TableStonecutter": BuildSpec("stonecutter's table", size=(3, 1), stuff=("Metallic", "Woody"), research="Stonecutting"),
-    "Shelf": BuildSpec("shelf", size=(2, 1), stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture"),
-    "Table2x2c": BuildSpec("table (2x2)", size=(2, 2), stuff=("Metallic", "Woody", "Stony")),
-    "Stool": BuildSpec("stool", stuff=("Metallic", "Woody", "Stony")),
-    "DiningChair": BuildSpec("dining chair", stuff=("Metallic", "Woody"), research="ComplexFurniture"),
-    "PassiveCooler": BuildSpec("passive cooler", research="PassiveCooler"),
-    "WoodFiredGenerator": BuildSpec("wood-fired generator", size=(2, 2), research="Electricity"),
-    "StandingLamp": BuildSpec("standing lamp", research="Electricity"),
-    "Barricade": BuildSpec("barricade", stuff=("Metallic", "Woody", "Stony")),
-    "HorseshoesPin": BuildSpec("horseshoes pin", stuff=("Metallic", "Woody", "Stony")),
-    "ChessTable": BuildSpec("chess table", stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture"),
+    "Wall": BuildSpec("wall", stuff=("Metallic", "Woody", "Stony"), stuff_count=5),
+    "Door": BuildSpec("door", stuff=("Metallic", "Woody", "Stony"), stuff_count=25),
+    # No zero-work "spots" (SleepingSpot, ButcherSpot, CraftingSpot): the game
+    # places those instantly, but RIMAPI's blueprint call makes a construction
+    # frame for them, which sticks and spams "construction botched" forever.
+    "Bed": BuildSpec("bed", size=(1, 2), stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture", stuff_count=45),
+    "DoubleBed": BuildSpec("double bed", size=(2, 2), stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture", stuff_count=85),
+    "Campfire": BuildSpec("campfire", cost=(("WoodLog", 20),)),
+    "TorchLamp": BuildSpec("torch lamp", cost=(("WoodLog", 20),)),
+    "TableButcher": BuildSpec("butcher table", size=(3, 1), stuff=("Metallic", "Woody"), stuff_count=75, cost=(("WoodLog", 20),)),
+    "FueledStove": BuildSpec("fueled stove", size=(3, 1), cost=(("Steel", 80),)),
+    "ElectricStove": BuildSpec("electric stove", size=(3, 1), research="Electricity", cost=(("Steel", 80), ("ComponentIndustrial", 2))),
+    "SimpleResearchBench": BuildSpec("simple research bench", size=(3, 2), stuff=("Metallic", "Woody", "Stony"), stuff_count=75, cost=(("Steel", 25),)),
+    "HandTailoringBench": BuildSpec("hand tailoring bench", size=(3, 1), stuff=("Metallic", "Woody"), research="ComplexClothing", stuff_count=75),
+    "TableStonecutter": BuildSpec("stonecutter's table", size=(3, 1), stuff=("Metallic", "Woody"), research="Stonecutting", stuff_count=75, cost=(("Steel", 30),)),
+    "Shelf": BuildSpec("shelf", size=(2, 1), stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture", stuff_count=20),
+    "Table2x2c": BuildSpec("table (2x2)", size=(2, 2), stuff=("Metallic", "Woody", "Stony"), stuff_count=50),
+    "Stool": BuildSpec("stool", stuff=("Metallic", "Woody", "Stony"), stuff_count=25),
+    "DiningChair": BuildSpec("dining chair", stuff=("Metallic", "Woody"), research="ComplexFurniture", stuff_count=45),
+    "PassiveCooler": BuildSpec("passive cooler", research="PassiveCooler", cost=(("WoodLog", 50),)),
+    "WoodFiredGenerator": BuildSpec("wood-fired generator", size=(2, 2), research="Electricity", cost=(("Steel", 100), ("ComponentIndustrial", 2))),
+    "StandingLamp": BuildSpec("standing lamp", research="Electricity", cost=(("Steel", 20),)),
+    "Barricade": BuildSpec("barricade", stuff=("Metallic", "Woody", "Stony"), stuff_count=5),
+    "HorseshoesPin": BuildSpec("horseshoes pin", stuff=("Metallic", "Woody", "Stony"), stuff_count=10),
+    "ChessTable": BuildSpec("chess table", stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture", stuff_count=70),
 }
 
 # Food and fibre crops that need no research. Drug and medicine crops are left

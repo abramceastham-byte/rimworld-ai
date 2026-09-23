@@ -8,6 +8,19 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from rimagent.actions import (
+    MAX_ACTIONS,
+    Action,
+    ChopTrees,
+    CreateGrowingZone,
+    CreateStockpile,
+    Designate,
+    AllowItems,
+    PlaceBlueprint,
+    RectAction,
+    Turn,
+    Wait,
+)
 from rimagent.blueprints import BlueprintTracker, Status, TrackedBlueprint
 from rimagent.construction import (
     CROPS,
@@ -39,94 +52,29 @@ from rimagent.rimapi import (
 from rimagent.runlog import RunLogger
 
 
-class Decision(BaseModel):
-    """What the model is allowed to answer. Anything else is rejected."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    action: Literal[
-        "pause",
-        "resume",
-        "wait",
-        "enable_work",
-        "disable_work",
-        "set_bill",
-        "create_growing_zone",
-        "create_stockpile",
-        "place_blueprint",
-        "designate",
-        "allow_items",
-        "chop_trees",
-    ]
-    reason: str = Field(min_length=1, max_length=300)
-    colonist: str | None = None  # a colonist's name, for enable_work / disable_work
-    work_type: str | None = None  # e.g. "Cooking", for enable_work / disable_work
-    building_id: int | None = Field(default=None, gt=0)
-    recipe_def_name: str | None = None
-    target_count: int | None = Field(default=None, ge=1, le=500)
-    # A rectangle, for create_growing_zone / create_stockpile / designate.
-    x1: int | None = Field(default=None, ge=0)
-    z1: int | None = Field(default=None, ge=0)
-    x2: int | None = Field(default=None, ge=0)
-    z2: int | None = Field(default=None, ge=0)
-    plant: str | None = None  # for create_growing_zone, e.g. "Plant_Potato"
-    designation: Literal["mine", "harvest", "hunt"] | None = None
-    # One building, for place_blueprint.
-    building_def: str | None = None
-    x: int | None = Field(default=None, ge=0)
-    z: int | None = Field(default=None, ge=0)
-    rotation: int = Field(default=0, ge=0, le=3)
-    stuff: str | None = None  # material, e.g. "WoodLog"
-
-    @model_validator(mode="after")
-    def actions_have_their_fields(self) -> "Decision":
-        # Runs after the fields are checked. Raising here makes parsing fail,
-        # so an incomplete action is rejected instead of half-run.
-        missing = [f for f in REQUIRED_FIELDS.get(self.action, ()) if getattr(self, f) is None]
-        if missing:
-            raise ValueError(f"{self.action} needs {', '.join(missing)}")
-        return self
-
-    def rect(self) -> Rect:
-        return Rect.from_corners(self.x1, self.z1, self.x2, self.z2)
-
-
-MAX_ACTIONS = 5
-
-
-class Turn(BaseModel):
-    """One reply: up to MAX_ACTIONS actions, carried out in order.
-
-    Several actions at once let the model lay out a room or set up a colonist
-    in one go, instead of one cell per decision. Pausing first (see TimeMode)
-    means no game time passes in between.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    actions: list[Decision] = Field(min_length=1, max_length=MAX_ACTIONS)
-    memory_update: MemoryUpdate | None = None
-
-
-RECT = ("x1", "z1", "x2", "z2")
-REQUIRED_FIELDS = {
-    "enable_work": ("colonist", "work_type"),
-    "disable_work": ("colonist", "work_type"),
-    "set_bill": ("building_id", "recipe_def_name", "target_count"),
-    "create_growing_zone": ("plant", *RECT),
-    "create_stockpile": RECT,
-    "place_blueprint": ("building_def", "x", "z"),
-    "designate": ("designation", *RECT),
-    "allow_items": RECT,
-    "chop_trees": RECT,
-}
+GAME_FACTS = (
+    "How RimWorld works (the rules behind your actions):\n"
+    "- Wood logs, steel and stone blocks are building materials; colonists carry them "
+    "to the site themselves. Rock chunks are not a material: blocks are cut from chunks "
+    "at a stonecutter's table, so with no blocks in your supplies, build in wood or steel.\n"
+    "- Forbidden items cannot be hauled or used at all. Allow them first, or the "
+    "blueprints that need them will never be built.\n"
+    "- A blueprint only becomes a building while time runs, and only if a colonist has "
+    "Construction enabled and enough allowed material is reachable.\n"
+    "- Chopping trees gives wood logs, which are usable straight away.\n"
+    "- A work table produces nothing until it has a bill.\n"
+    "- Growing zones only work on fertile soil, and crops are sown and harvested by "
+    "colonists with Growing enabled.\n"
+    "- Colonists sleep on the ground and lose mood until they have beds.\n"
+    "- Wealth attracts bigger raids, so build what the colony needs, not everything.\n"
+)
 
 
 INSTRUCTIONS = (
     "You are managing a RimWorld colony.\n"
-    "Choose exactly one action: pause, resume, wait, enable_work, disable_work, "
-    "set_bill, create_growing_zone, create_stockpile, place_blueprint, designate, "
-    "allow_items, chop_trees.\n"
+    "Your actions are: pause, resume, wait, enable_work, disable_work, set_bill, "
+    "create_growing_zone, create_stockpile, place_blueprint, designate, allow_items, "
+    "chop_trees.\n"
     "Pause and resume control time. The game is always paused while you decide; while "
     "time is running, it runs for a short while after each decision. Choose pause to "
     "stop time: while paused you can give as many orders as you like, and colonists "
@@ -553,8 +501,9 @@ def describe_map(
     buildable = available_buildings(finished_research)
     lines += ["", "Buildable (def name, size facing north, material types):"]
     for name, spec in buildable.items():
-        material = "/".join(spec.stuff) if spec.stuff else "fixed cost"
-        lines.append(f"- {name} ({spec.label}), {spec.size[0]}x{spec.size[1]}, {material}")
+        lines.append(
+            f"- {name} ({spec.label}), {spec.size[0]}x{spec.size[1]}, needs {spec.cost_text()}"
+        )
     lines.append(
         "Stuff materials: "
         + "; ".join(f"{cat} = {', '.join(names)}" for cat, names in STUFF_BY_CATEGORY.items())
@@ -568,19 +517,19 @@ def describe_map(
     return lines
 
 
-def describe_placement(decision: Decision, result: object) -> str:
+def describe_placement(action: Action, result: object) -> str:
     """A short record of a successful map action, for later prompts."""
-    if decision.action == "create_growing_zone":
-        return f"{decision.plant} field {decision.rect()} (zone {result})"
-    if decision.action == "create_stockpile":
-        return f"stockpile {decision.rect()} (zone {result})"
-    if decision.action == "place_blueprint":
-        return f"{decision.building_def} blueprint covering {result}"
-    if decision.action == "allow_items":
-        return f"allowed {result} item stacks in {decision.rect()}"
-    if decision.action == "chop_trees":
-        return f"marked {result} trees for cutting in {decision.rect()}"
-    return f"{decision.designation} designation {decision.rect()}"
+    if isinstance(action, CreateGrowingZone):
+        return f"{action.plant} field {action.rect()} (zone {result})"
+    if isinstance(action, CreateStockpile):
+        return f"stockpile {action.rect()} (zone {result})"
+    if isinstance(action, PlaceBlueprint):
+        return f"{action.building_def} blueprint covering {result}"
+    if isinstance(action, AllowItems):
+        return f"allowed {result} item stacks in {action.rect()}"
+    if isinstance(action, ChopTrees):
+        return f"marked {result} trees for cutting in {action.rect()}"
+    return f"{action.designation} designation {action.rect()}"
 
 
 def build_prompt(
@@ -628,15 +577,7 @@ def build_prompt(
         *(map_lines or []),
         "",
     ]
-    return "\n".join(lines) + INSTRUCTIONS + "\n" + memory.to_prompt()
-
-
-def parse_decision(reply: str) -> Decision:
-    """Turn the model's raw reply into a Decision, falling back to "wait"."""
-    try:
-        return Decision.model_validate_json(reply)
-    except ValidationError:
-        return Decision(action="wait", reason="could not parse reply")
+    return "\n".join(lines) + GAME_FACTS + INSTRUCTIONS + "\n" + memory.to_prompt()
 
 
 def request_turn(
@@ -691,13 +632,14 @@ def request_turn(
                     + "\nReturn one corrected JSON object only."
                 )
 
-    action: Literal["pause", "wait"] = "pause" if danger_present else "wait"
+    # The fallback only waits: with the loop in charge of time, waiting is
+    # already the safe option, and it keeps the game paused during a threat.
     reason = (
-        "model failed twice; paused because a threat is present"
+        "model failed twice; waiting (a threat is present)"
         if danger_present
         else "model failed twice; waiting safely"
     )
-    return Turn(actions=[Decision(action=action, reason=reason)]), last_reply
+    return Turn(actions=[Wait(action="wait", reason=reason)]), last_reply
 
 
 def colonist_id(colonists: list[Colonist], name: str | None) -> int:
@@ -731,7 +673,7 @@ def run(
     """
     work_tables: list[WorkTable] = []
 
-    def set_bill(d: Decision, cols: list[Colonist]) -> None:
+    def set_bill(d: Action, cols: list[Colonist]) -> None:
         # work_tables is this step's list (read below, before any action runs).
         require_work_table(d.building_id, work_tables)
         client.set_target_bill(d.building_id, d.recipe_def_name, d.target_count)
@@ -739,7 +681,7 @@ def run(
     # Each action gets the decision and this step's colonists, so work actions
     # can turn the colonist's name into the id RIMAPI needs. pause and resume do
     # nothing here: the loop decides whether time runs after each step.
-    actions: dict[str, Callable[[Decision, list[Colonist]], object]] = {
+    handlers: dict[str, Callable[[Action, list[Colonist]], object]] = {
         "wait": lambda d, cols: None,
         "pause": lambda d, cols: None,
         "resume": lambda d, cols: None,
@@ -854,7 +796,7 @@ def run(
             for index, decision in enumerate(turn.actions):
                 error = None
                 try:
-                    result = actions[decision.action](decision, colonists)
+                    result = handlers[decision.action](decision, colonists)
                 except (RimApiError, ValueError) as e:
                     # RimApiError: RIMAPI refused (e.g. work the colonist can't do).
                     # ValueError: our own checks refused, e.g. an unknown colonist,
@@ -891,33 +833,17 @@ def run(
                         "step": step,
                         "action_index": index,
                         "actions_in_turn": len(turn.actions),
-                        # The prompt is the same for every action in a turn, so
-                        # it is logged once, with the first.
+                        # Each action type carries only its own fields.
+                        **decision.model_dump(),
+                        # The prompt, reply and reasoning are the same for every
+                        # action in a turn, so they are logged once, with the first.
                         "prompt": prompt if index == 0 else None,
                         "reply": reply if index == 0 else None,
-                        "action": decision.action,
-                        "colonist": decision.colonist,
-                        "work_type": decision.work_type,
-                        "building_id": decision.building_id,
-                        "recipe_def_name": decision.recipe_def_name,
-                        "target_count": decision.target_count,
-                        "rect": (
-                            [decision.x1, decision.z1, decision.x2, decision.z2]
-                            if decision.x1 is not None
-                            else None
-                        ),
-                        "plant": decision.plant,
-                        "designation": decision.designation,
-                        "building_def": decision.building_def,
-                        "position": [decision.x, decision.z] if decision.x is not None else None,
-                        "rotation": decision.rotation,
-                        "stuff": decision.stuff,
-                        "reason": decision.reason,
                         "time_status": time_status if index == 0 else None,
                         "time_mode": mode_at_decision.to_log(),  # as the model saw it
                         "error": error,
-                        # The model's reasoning, for reading later. It is not put
-                        # back into the next prompt. None for models without it.
+                        # The model's reasoning is for reading later; it is never
+                        # put back into the next prompt. None for models without it.
                         "thinking": getattr(model, "last_thinking", None) if index == 0 else None,
                         "model_stats": getattr(model, "last_stats", None) if index == 0 else None,
                     }

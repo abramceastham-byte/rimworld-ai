@@ -3,7 +3,8 @@ from unittest.mock import Mock, call
 
 from pydantic import ValidationError
 
-from rimagent.agent import Decision, describe_work_table
+from rimagent.actions import SetBill
+from rimagent.agent import describe_work_table
 from rimagent.rimapi import RimApiClient, WorkTable
 
 
@@ -21,10 +22,10 @@ RECIPES = [
 class DecisionTests(unittest.TestCase):
     def test_set_bill_requires_all_fields(self) -> None:
         with self.assertRaises(ValidationError):
-            Decision(action="set_bill", building_id=12, recipe_def_name="CookMealSimple")
+            SetBill(action="set_bill", building_id=12, recipe_def_name="CookMealSimple", reason="x")
 
     def test_set_bill_accepts_safe_target_count(self) -> None:
-        decision = Decision(
+        decision = SetBill(
             action="set_bill",
             building_id=12,
             recipe_def_name="CookMealSimple",
