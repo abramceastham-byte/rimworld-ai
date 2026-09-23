@@ -89,6 +89,11 @@ class ChopTrees(RectAction):
     action: Literal["chop_trees"]
 
 
+class SetResearch(BaseAction):
+    action: Literal["set_research"]
+    project: str  # def name from the available list, e.g. "Brewing"
+
+
 class PlaceBlueprint(BaseAction):
     action: Literal["place_blueprint"]
     building_def: str
@@ -100,7 +105,7 @@ class PlaceBlueprint(BaseAction):
 
 Action = Annotated[
     Union[
-        Wait, Pause, Resume, EnableWork, DisableWork, SetBill,
+        Wait, Pause, Resume, EnableWork, DisableWork, SetBill, SetResearch,
         CreateGrowingZone, CreateStockpile, PlaceBlueprint, Designate,
         AllowItems, ChopTrees,
     ],

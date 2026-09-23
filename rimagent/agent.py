@@ -14,10 +14,11 @@ from rimagent.actions import (
     ChopTrees,
     CreateGrowingZone,
     CreateStockpile,
-    Designate,
     AllowItems,
+    Designate,
     PlaceBlueprint,
     RectAction,
+    SetResearch,
     Turn,
     Wait,
 )
@@ -31,7 +32,21 @@ from rimagent.construction import (
     Rect,
     TerrainMap,
     available_buildings,
-    map_symbol,
+)
+from rimagent.mapview import (
+    BLUEPRINT,
+    BUILDING,
+    COLONIST,
+    DOOR,
+    FORBIDDEN,
+    FRAME,
+    TREE,
+    WALL,
+    centre_of,
+    detail_bounds,
+    detail_rows,
+    free_spots,
+    overview_rows,
 )
 from rimagent.events import EventListener, GameEvent
 from rimagent.memory import AgentMemory, MemoryUpdate
@@ -45,6 +60,7 @@ from rimagent.rimapi import (
     MapThing,
     RimApiClient,
     RimApiError,
+    ResearchState,
     Threat,
     WorkTable,
     Zone,
@@ -63,6 +79,8 @@ GAME_FACTS = (
     "Construction enabled and enough allowed material is reachable.\n"
     "- Chopping trees gives wood logs, which are usable straight away.\n"
     "- A work table produces nothing until it has a bill.\n"
+    "- A research bench is not a work table and takes no bills: choose a project with "
+    "set_research, and a colonist with Research enabled works on it.\n"
     "- Growing zones only work on fertile soil, and crops are sown and harvested by "
     "colonists with Growing enabled.\n"
     "- Colonists sleep on the ground and lose mood until they have beds.\n"
@@ -74,7 +92,7 @@ INSTRUCTIONS = (
     "You are managing a RimWorld colony.\n"
     "Your actions are: pause, resume, wait, enable_work, disable_work, set_bill, "
     "create_growing_zone, create_stockpile, place_blueprint, designate, allow_items, "
-    "chop_trees.\n"
+    "chop_trees, set_research.\n"
     "Pause and resume control time. The game is always paused while you decide; while "
     "time is running, it runs for a short while after each decision. Choose pause to "
     "stop time: while paused you can give as many orders as you like, and colonists "
@@ -117,7 +135,8 @@ INSTRUCTIONS = (
     "carried out in order, each with its own reason. Use several when they belong "
     "together, such as walls and a door for one room, or the parts of a bedroom; pause "
     "first if you want to set up a lot without time passing. Each action is checked on "
-    "its own, and you are told which ones worked.\n"
+    "its own, and you are told which ones worked. Later actions still run even if an "
+    "earlier one fails, so never make one action depend on another in the same reply.\n"
     '{"actions": [<action>, <action>], "memory_update": <optional, see below>}\n'
     "The templates below show the shape of each action; they are not suggestions. "
     "Replace every <...> with a value you read from the current state above (a real "
@@ -140,6 +159,8 @@ INSTRUCTIONS = (
     '{"action": "allow_items", "x1": <x>, "z1": <z>, "x2": <x>, "z2": <z>, '
     '"reason": "<why>"}\n'
     '{"action": "chop_trees", "x1": <x>, "z1": <z>, "x2": <x>, "z2": <z>, '
+    '"reason": "<why>"}\n'
+    '{"action": "set_research", "project": "<project def name from Research>", '
     '"reason": "<why>"}\n'
     "Any reply may also carry one memory_update beside the actions list, for example:\n"
     '{"actions": [{"action": "wait", "reason": "<why>"}], "memory_update": '
@@ -330,6 +351,25 @@ def honest_memory_update(update: MemoryUpdate | None, any_failed: bool) -> Memor
     return MemoryUpdate(observation=update.observation) if update.observation else None
 
 
+def require_work_change(
+    colonists: list[Colonist], name: str | None, work_type: str | None, enable: bool
+) -> tuple[int, str]:
+    """Refuse work changes that would change nothing, and say so.
+
+    Models repeat enable_work for work a colonist already does (12 calls in one
+    run, 11 of them no-ops) because a silent success teaches them nothing.
+    """
+    colonist = next((c for c in colonists if name and c.name.lower() == name.lower()), None)
+    if colonist is None:
+        raise ValueError(f"no colonist named {name!r}")
+    doing = {w.work_type for w in colonist.work_priorities}
+    if enable and work_type in doing:
+        raise ValueError(f"{colonist.name} already does {work_type}; nothing to change")
+    if not enable and work_type not in doing:
+        raise ValueError(f"{colonist.name} already does not do {work_type}; nothing to change")
+    return colonist.id, work_type
+
+
 def require_work_table(building_id: int | None, work_tables: list[WorkTable]) -> None:
     """Refuse bills on anything but a built work table, before asking RIMAPI."""
     if building_id not in {t.id for t in work_tables}:
@@ -404,6 +444,19 @@ def describe_supplies(items: list[MapThing], limit: int = 12) -> list[str]:
     ]
 
 
+def describe_research(state: ResearchState) -> list[str]:
+    """What the colony is researching, and what it could start instead."""
+    if state.current:
+        now = f"Researching {state.current.label} ({state.current.progress_percent:.0f}% done)."
+    else:
+        now = "Researching nothing."
+    if not state.has_bench:
+        return [now + " No research bench is built, so no research happens yet."]
+    choices = ", ".join(f"{p.name} ({p.label}, {p.research_points:.0f} points)"
+                        for p in state.available[:8]) or "none"
+    return [now, f"Could start now: {choices}."]
+
+
 def describe_map(
     colonists: list[Colonist],
     terrain: TerrainMap,
@@ -416,58 +469,91 @@ def describe_map(
     blueprints: list[tuple[TrackedBlueprint, Status]] | None = None,
     buildings: list[Building] | None = None,
 ) -> list[str]:
-    """Everything the model needs to pick coordinates without inventing them."""
+    """Everything the model needs to pick a place without reading the grid.
+
+    Two scales (see mapview): a coarse overview of the surroundings, and a
+    detail view that follows the base. Exact positions are also listed in text
+    below, and free_spots offers rectangles that are already clear.
+    """
     forbidden = [i for i in items or [] if i.is_forbidden]
-    blueprint_marks = {"waiting": "b", "under construction": "F", "built": "B"}
-    lines = [f"Map: {terrain.width} x {terrain.height} cells. x grows east, z grows north."]
+    blueprint_marks = {"waiting": BLUEPRINT, "under construction": FRAME}
+    lines = [f"Map: {terrain.width} x {terrain.height} cells. x grows east, z grows north.",
+             "Positions below are exact; read them from the text, not by counting the grid."]
     for c in colonists:
         if c.position:
             lines.append(f"- {c.name} is at ({c.position.x}, {c.position.z}).")
 
-    center = colony_center(colonists)
-    if center:
-        cx, cz = center
-        r = MINIMAP_RADIUS
-        x1, x2 = max(0, cx - r), min(terrain.width - 1, cx + r)
-        z1, z2 = max(0, cz - r), min(terrain.height - 1, cz + r)
-        # Most important mark wins when several share a cell.
-        marks: dict[tuple[int, int], str] = {}
-        for t in trees or []:
-            marks[(t.position.x, t.position.z)] = "T"
-        for i in forbidden:
-            marks[(i.position.x, i.position.z)] = "f"
-        for b in buildings or []:
-            mark = ("F" if b.under_construction else
-                    "#" if b.def_name == "Wall" else
-                    "+" if b.def_name == "Door" else "n")
-            for cell in b.area():
-                marks[cell] = mark
-        for bp, status in blueprints or []:
-            if status in blueprint_marks:
-                for cell in bp.area():
-                    marks[cell] = blueprint_marks[status]
-        for c in colonists:
-            if c.position:
-                marks[(c.position.x, c.position.z)] = "@"
-        lines += [
-            "",
-            f"Map around the colony, x {x1}-{x2} left to right, z {z2} (top) down to {z1}:",
-            "  R rich soil  . soil (any crop)  , poor soil  _ stone/floor, nothing grows",
-            "  ~ water/marsh (no heavy building)  @ colonist  T tree  f forbidden item",
-            "  # wall  + door  n other building  F under construction  b your blueprint (not started)",
-            "  Rock and allowed items are not shown; blocked spots are rejected with a reason.",
-        ]
-        for z in range(z2, z1 - 1, -1):
-            row = "".join(
-                marks.get((x, z)) or map_symbol(defs.terrain.get(terrain.at(x, z)))
-                for x in range(x1, x2 + 1)
-            )
-            lines.append(f"  z={z:3d} {row}")
+    # One mark per cell; the most important thing wins.
+    marks: dict[tuple[int, int], str] = {}
+    tree_cells = {(t.position.x, t.position.z) for t in trees or []}
+    for cell in tree_cells:
+        marks[cell] = TREE
+    for i in forbidden:
+        marks[(i.position.x, i.position.z)] = FORBIDDEN
+    built_cells: set[tuple[int, int]] = set()
+    for b in buildings or []:
+        mark = (FRAME if b.under_construction else
+                WALL if b.def_name == "Wall" else
+                DOOR if b.def_name == "Door" else BUILDING)
+        for cell in b.area():
+            marks[cell] = mark
+            built_cells.add(cell)
+    for bp, status in blueprints or []:
+        if status in blueprint_marks:
+            for cell in bp.area():
+                marks[cell] = blueprint_marks[status]
+                built_cells.add(cell)
+    for c in colonists:
+        if c.position:
+            marks[(c.position.x, c.position.z)] = COLONIST
 
-        view = Rect(x1, z1, x2, z2)
-        lines += describe_supplies([i for i in items or [] if view.contains(i.position.x, i.position.z)])
-        near_trees = sum(1 for t in trees or [] if view.contains(t.position.x, t.position.z))
-        lines.append(f"Trees on this map section: {near_trees}.")
+    # The base is the anchor once anything is built; colonists before that.
+    base_cells = [(b.position.x, b.position.z) for b in buildings or []]
+    base_cells += [(bp.x, bp.z) for bp, status in blueprints or [] if status != "gone"]
+    colonist_cells = [(c.position.x, c.position.z) for c in colonists if c.position]
+    anchor = centre_of(base_cells) or centre_of(colonist_cells)
+    if anchor is None:
+        return lines
+
+    view = detail_bounds(anchor, base_cells + colonist_cells, terrain.width, terrain.height)
+    lines += ["", *overview_rows(anchor, terrain, defs.terrain, tree_cells, built_cells)]
+    lines += ["", *detail_rows(view, terrain, defs.terrain, marks)]
+
+    spots = free_spots(anchor, terrain, defs.terrain, built_cells)
+    if spots:
+        lines += ["", "Free spots near the base, nothing in the way (use these coordinates):"]
+        lines += [f"  {letter}: {rect} - {note}" for letter, rect, note in spots]
+
+    lines += ["", *describe_supplies([i for i in items or [] if view.contains(i.position.x, i.position.z)])]
+    # Where to point allow_items: the nearest forbidden items, not a box around
+    # every one on the map (which covers everything and helps nobody).
+    def steps_away(i: MapThing) -> int:
+        return max(abs(i.position.x - anchor[0]), abs(i.position.z - anchor[1]))
+
+    # The nearest cluster, not every nearby item: a box around scattered items
+    # is larger than allow_items accepts.
+    closest_first = sorted((i for i in forbidden if steps_away(i) <= 30), key=steps_away)
+    near = []
+    if closest_first:
+        first = closest_first[0]
+        near = [i for i in closest_first
+                if max(abs(i.position.x - first.position.x),
+                       abs(i.position.z - first.position.z)) <= 8]
+    if not near and forbidden:
+        closest = min(forbidden, key=steps_away)
+        lines.append(f"No forbidden items near the base; the closest is {closest.def_name} at "
+                     f"({closest.position.x},{closest.position.z}), {steps_away(closest)} cells away.")
+    elif near:
+        box = Rect.from_corners(
+            min(i.position.x for i in near), min(i.position.z for i in near),
+            max(i.position.x for i in near), max(i.position.z for i in near),
+        )
+        kinds = ", ".join(sorted({i.def_name for i in near})[:6])
+        lines.append(f"Nearest forbidden items ({kinds}) are inside {box}; allow_items only "
+                     "works on a rectangle that actually contains some.")
+    else:
+        lines.append("Nothing on the map is forbidden, so allow_items has nothing to do.")
+    lines.append(f"Trees in the detail view: {sum(1 for cell in tree_cells if view.contains(*cell))}.")
 
     lines += ["", "Zones: " + (", ".join(f"{z.label} ({z.type}, {z.cells_count} cells)" for z in zones) or "none") + "."]
     lines.append("Placed by you: " + ("; ".join(placements) or "nothing yet") + ".")
@@ -499,11 +585,12 @@ def describe_map(
         lines.append("Your blueprints: none.")
 
     buildable = available_buildings(finished_research)
-    lines += ["", "Buildable (def name, size facing north, material types):"]
+    lines += ["", "Buildable (def name, size facing north, what it costs):"]
     for name, spec in buildable.items():
         lines.append(
             f"- {name} ({spec.label}), {spec.size[0]}x{spec.size[1]}, needs {spec.cost_text()}"
         )
+
     lines.append(
         "Stuff materials: "
         + "; ".join(f"{cat} = {', '.join(names)}" for cat, names in STUFF_BY_CATEGORY.items())
@@ -540,6 +627,7 @@ def build_prompt(
     events: list[GameEvent],
     work_types: list[str],
     work_tables: list[WorkTable],
+    research: ResearchState,
     time_status: str,
     memory: AgentMemory,
     map_lines: list[str] | None = None,
@@ -567,6 +655,8 @@ def build_prompt(
         *[describe_colonist(c) for c in colonists],
         "",
         "Work types: " + ", ".join(work_types) + ".",
+        "",
+        "Research: " + " ".join(describe_research(research)),
         "",
         "Work tables and production bills:",
         *(
@@ -686,11 +776,12 @@ def run(
         "pause": lambda d, cols: None,
         "resume": lambda d, cols: None,
         "enable_work": lambda d, cols: client.enable_work(
-            colonist_id(cols, d.colonist), d.work_type
+            *require_work_change(cols, d.colonist, d.work_type, enable=True)
         ),
         "disable_work": lambda d, cols: client.disable_work(
-            colonist_id(cols, d.colonist), d.work_type
+            *require_work_change(cols, d.colonist, d.work_type, enable=False)
         ),
+        "set_research": lambda d, cols: client.set_research(d.project),
         "set_bill": set_bill,
         # Map actions return the zone id or covered cells, for describe_placement.
         "create_growing_zone": lambda d, cols: client.create_growing_zone(d.plant, d.rect()),
@@ -774,6 +865,7 @@ def run(
                 new_events,
                 work_types,
                 work_tables,
+                client.get_research(),
                 time_status,
                 memory,
                 map_lines,

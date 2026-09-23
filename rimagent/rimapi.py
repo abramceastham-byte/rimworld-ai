@@ -164,6 +164,24 @@ class Building(BaseModel):
         return footprint(self.position.x, self.position.z, (self.size.x, self.size.z), self.rotation)
 
 
+class ResearchProject(BaseModel):
+    name: str          # def name, e.g. "Brewing"
+    label: str = ""
+    research_points: float = 0
+    tech_level: str = ""
+    can_start_now: bool = False
+    is_finished: bool = False
+    progress_percent: float = 0
+
+    model_config = {"extra": "allow"}
+
+
+class ResearchState(BaseModel):
+    current: ResearchProject | None = None   # None when nothing is being researched
+    has_bench: bool = False                  # a research bench is built
+    available: list[ResearchProject] = Field(default_factory=list)  # can be started now
+
+
 class Zone(BaseModel):
     """A growing zone or stockpile. RIMAPI reports its size but not its location."""
 
@@ -541,6 +559,38 @@ class RimApiClient:
         """Growing zones and stockpiles (not the Home/roof areas)."""
         data = self._request("GET", "/api/v1/map/zones", params={"map_id": map_id})
         return [Zone.model_validate(z) for z in data.get("zones") or []]
+
+    def get_research(self) -> ResearchState:
+        """What the colony is researching, and what it could start.
+
+        A research bench takes a project, not bills, so this is separate from
+        work tables.
+        """
+        progress = self._request("GET", "/api/v1/research/progress")
+        projects = [ResearchProject.model_validate(p)
+                    for p in self._request("GET", "/api/v1/research/tree")["projects"]]
+        current = None
+        if progress.get("name") and progress["name"] != "none":
+            current = ResearchProject.model_validate(progress)
+        return ResearchState(
+            current=current,
+            has_bench=bool(progress.get("player_has_any_appropriate_research_bench")),
+            available=sorted((p for p in projects if p.can_start_now and not p.is_finished),
+                             key=lambda p: p.research_points),
+        )
+
+    def set_research(self, project: str) -> str:
+        """Start researching a project. Returns its label."""
+        state = self.get_research()
+        match = next((p for p in state.available if p.name.lower() == project.lower()), None)
+        if match is None:
+            choices = ", ".join(p.name for p in state.available[:10]) or "none"
+            if not state.has_bench:
+                raise ValueError("no research bench is built yet, so no project can be started")
+            raise ValueError(f"{project!r} cannot be started now; available projects: {choices}")
+        self._request("POST", "/api/v1/research/target",
+                      params={"name": match.name, "force": False})
+        return match.label or match.name
 
     def get_finished_research(self) -> set[str]:
         return set(self._request("GET", "/api/v1/research/finished")["finished_projects"])

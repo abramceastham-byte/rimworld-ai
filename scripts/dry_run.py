@@ -43,7 +43,8 @@ def live_prompt(client: RimApiClient) -> str:
     )
     return build_prompt(
         state, colonists, client.get_alerts(), client.get_threats(), [], client.get_work_types(),
-        client.get_work_tables(), describe_time(start_mode(state), None, 10, 3), memory,
+        client.get_work_tables(), client.get_research(),
+        describe_time(start_mode(state), None, 10, 3), memory,
         map_lines,
     )
 
