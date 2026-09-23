@@ -71,6 +71,17 @@ class TurnTests(unittest.TestCase):
             '"x1": 110, "z1": 120, "x2": 113, "z2": 123, "reason": "potatoes"}]}'
         )
 
+    def test_action_is_the_first_field_of_every_action(self) -> None:
+        # Constrained decoding fills properties in schema order and picks a
+        # branch of the union at the first one. With "reason" first, the branch
+        # was chosen before the action was known and the model's choice was
+        # overwritten: a whole run came out as place_blueprint with reasons
+        # describing chopping trees and making zones.
+        for name, spec in Turn.model_json_schema()["$defs"].items():
+            properties = list(spec.get("properties", {}))
+            if "action" in properties:
+                self.assertEqual(properties[0], "action", f"{name} must declare action first")
+
     def test_the_schema_tells_the_model_each_action_shape(self) -> None:
         schema = Turn.model_json_schema()
         zone = schema["$defs"]["CreateGrowingZone"]

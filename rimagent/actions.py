@@ -21,6 +21,12 @@ MAX_ACTIONS = 5
 class BaseAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # "action" must be the first field of every action. Constrained decoding
+    # writes properties in schema order and has to choose a branch of the union
+    # at the first one; if "reason" came first the branch was picked before the
+    # action name existed, and the action was then forced to whatever that
+    # branch was (a whole run of place_blueprint with unrelated reasons).
+    action: str
     reason: str = Field(min_length=1, max_length=300)
 
 
