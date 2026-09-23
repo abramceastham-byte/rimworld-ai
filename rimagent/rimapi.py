@@ -175,6 +175,11 @@ class ResearchProject(BaseModel):
     can_start_now: bool = False
     is_finished: bool = False
     progress_percent: float = 0
+    prerequisites: list[str] = Field(default_factory=list)
+    # True when the colony has a bench able to research this project. The
+    # /research/progress placeholder for "nothing being researched" always says
+    # false, so only the tree's answer can be trusted.
+    player_has_any_appropriate_research_bench: bool = False
 
     model_config = {"extra": "allow"}
 
@@ -183,6 +188,7 @@ class ResearchState(BaseModel):
     current: ResearchProject | None = None   # None when nothing is being researched
     has_bench: bool = False                  # a research bench is built
     available: list[ResearchProject] = Field(default_factory=list)  # can be started now
+    all_projects: list[ResearchProject] = Field(default_factory=list)
 
 
 class Zone(BaseModel):
@@ -584,9 +590,10 @@ class RimApiClient:
             current = ResearchProject.model_validate(progress)
         return ResearchState(
             current=current,
-            has_bench=bool(progress.get("player_has_any_appropriate_research_bench")),
+            has_bench=any(p.player_has_any_appropriate_research_bench for p in projects),
             available=sorted((p for p in projects if p.can_start_now and not p.is_finished),
                              key=lambda p: p.research_points),
+            all_projects=projects,
         )
 
     def set_research(self, project: str) -> str:
@@ -595,9 +602,23 @@ class RimApiClient:
         match = next((p for p in state.available if p.name.lower() == project.lower()), None)
         if match is None:
             choices = ", ".join(p.name for p in state.available[:10]) or "none"
-            if not state.has_bench:
-                raise ValueError("no research bench is built yet, so no project can be started")
-            raise ValueError(f"{project!r} cannot be started now; available projects: {choices}")
+            known = next((p for p in state.all_projects if p.name.lower() == project.lower()), None)
+            if known is None:
+                raise ValueError(
+                    f"{project!r} is not a research project in this game. "
+                    f"Projects you can start now: {choices}"
+                )
+            if known.is_finished:
+                raise ValueError(f"{known.label or known.name} is already researched")
+            if not known.player_has_any_appropriate_research_bench:
+                raise ValueError(
+                    f"{known.name} needs a research bench the colony does not have yet"
+                )
+            missing = ", ".join(known.prerequisites) or "an earlier project"
+            raise ValueError(
+                f"{known.name} cannot be started yet: it needs {missing} first. "
+                f"Projects you can start now: {choices}"
+            )
         self._request("POST", "/api/v1/research/target",
                       params={"name": match.name, "force": False})
         return match.label or match.name
