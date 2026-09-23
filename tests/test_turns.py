@@ -3,13 +3,14 @@
 Run from the repo root:  python -m unittest tests/test_turns.py -v
 """
 
+import tempfile
 import unittest
 
 from pydantic import ValidationError
 
 from rimagent.actions import MAX_ACTIONS, Turn
-from rimagent.agent import describe_supplies, honest_memory_update, stock_by_def
-from rimagent.memory import MemoryUpdate
+from rimagent.agent import describe_supplies, stock_by_def
+from rimagent.memory import AgentMemory, MemoryUpdate
 from rimagent.rimapi import Building, MapThing
 
 
@@ -104,26 +105,64 @@ class TurnTests(unittest.TestCase):
         self.assertNotIn("stuff", zone["properties"])
 
 
-class HonestMemoryTests(unittest.TestCase):
-    def test_plan_changes_are_dropped_when_an_action_failed(self) -> None:
-        update = MemoryUpdate(
-            observation="Bench still not built.",
+class PlanConfirmationTests(unittest.TestCase):
+    """A step reported completed is held until a later turn confirms it; the rest
+    of the plan is always kept, whatever happened to the turn's orders."""
+
+    def memory(self) -> AgentMemory:
+        return AgentMemory(tempfile.mkdtemp())
+
+    def plan(self, *steps, status="active") -> MemoryUpdate:
+        return MemoryUpdate(replace_plan={"objective": "Shelter", "status": status, "steps": [
+            {"description": d, "status": s} for d, s in steps]})
+
+    def status_of(self, memory: AgentMemory, description: str) -> str:
+        return next(s.status for s in memory.state.current_plan.steps if s.description == description)
+
+    def test_a_new_completion_waits_for_a_later_turn(self) -> None:
+        memory = self.memory()
+        memory.apply_update(1, 100, self.plan(("Build bedroom", "pending")))
+        memory.apply_update(2, 200, self.plan(("Build bedroom", "completed")))  # same reply as its orders
+        self.assertEqual(self.status_of(memory, "Build bedroom"), "in_progress")
+        self.assertIn("in_progress: Build bedroom (you reported it done: mark it completed again once "
+                      "the game shows it)", memory.to_prompt())
+        memory.apply_update(3, 300, self.plan(("Build bedroom", "completed")))  # still done a turn later
+        self.assertEqual(self.status_of(memory, "Build bedroom"), "completed")
+        self.assertEqual(memory.state.unconfirmed, [])
+
+    def test_a_claim_dropped_next_turn_is_forgotten(self) -> None:
+        memory = self.memory()
+        memory.apply_update(1, 100, self.plan(("Build bedroom", "completed")))
+        memory.apply_update(2, 200, self.plan(("Build bedroom", "in_progress")))  # it wasn't done after all
+        self.assertEqual(self.status_of(memory, "Build bedroom"), "in_progress")
+        self.assertEqual(memory.state.unconfirmed, [])
+        memory.apply_update(3, 300, self.plan(("Build bedroom", "completed")))  # a fresh claim waits again
+        self.assertEqual(self.status_of(memory, "Build bedroom"), "in_progress")
+
+    def test_steps_already_completed_stay_completed(self) -> None:
+        memory = self.memory()
+        memory.apply_update(1, 100, self.plan(("Chop wood", "completed")))
+        memory.apply_update(2, 200, self.plan(("Chop wood", "completed")))
+        memory.apply_update(3, 300, self.plan(("Chop wood", "completed"), ("Build bedroom", "pending")))
+        self.assertEqual(self.status_of(memory, "Chop wood"), "completed")
+
+    def test_the_whole_plan_is_held_the_same_way(self) -> None:
+        memory = self.memory()
+        memory.apply_update(1, 100, self.plan(("Build bedroom", "pending")))
+        memory.apply_update(2, 200, self.plan(("Build bedroom", "pending"), status="completed"))
+        self.assertEqual(memory.state.current_plan.status, "active")
+        memory.apply_update(3, 300, self.plan(("Build bedroom", "pending"), status="completed"))
+        self.assertEqual(memory.state.current_plan.status, "completed")
+
+    def test_plan_and_policies_are_kept_whatever_the_orders_did(self) -> None:
+        # There's no longer a failure flag: nothing the orders did drops a plan.
+        memory = self.memory()
+        memory.apply_update(1, 100, MemoryUpdate(
+            observation="Bench still not built.", policies_to_add=["Build in wood"],
             replace_plan={"objective": "Tailoring", "status": "active",
-                          "steps": [{"description": "Set bill", "status": "completed"}]},
-            policies_to_add=["Always tailor"],
-        )
-        kept = honest_memory_update(update, any_failed=True)
-        self.assertIsNone(kept.replace_plan)
-        self.assertEqual(kept.policies_to_add, [])
-        self.assertEqual(kept.observation, "Bench still not built.")  # observations survive
-
-    def test_nothing_is_dropped_when_everything_worked(self) -> None:
-        update = MemoryUpdate(policies_to_add=["Keep 20 meals"])
-        self.assertIs(honest_memory_update(update, any_failed=False), update)
-
-    def test_an_update_with_only_a_plan_becomes_nothing(self) -> None:
-        update = MemoryUpdate(replace_plan={"objective": "x", "status": "active", "steps": []})
-        self.assertIsNone(honest_memory_update(update, any_failed=True))
+                          "steps": [{"description": "Set bill", "status": "pending"}]}))
+        self.assertEqual(memory.state.current_plan.objective, "Tailoring")
+        self.assertEqual(memory.state.policies, ["Build in wood"])
 
 
 class SuppliesTests(unittest.TestCase):
@@ -133,14 +172,16 @@ class SuppliesTests(unittest.TestCase):
         self.assertEqual(stock_by_def(items, forbidden=False), {"WoodLog": 96})
         self.assertEqual(stock_by_def(items, forbidden=True), {"WoodLog": 220, "Steel": 480})
 
-        usable, locked = describe_supplies(items)
-        self.assertIn("you can use now: WoodLog 96.", usable)
+        usable, locked, stuff = describe_supplies(items)
+        self.assertIn("Allowed items on the map (usable): WoodLog 96.", usable)
         self.assertIn("Steel 480, WoodLog 220", locked)  # biggest first
+        self.assertIn("usable now: WoodLog 96; stone blocks: none.", stuff)
 
     def test_says_nothing_when_there_is_nothing(self) -> None:
-        usable, locked = describe_supplies([])
-        self.assertIn("use now: nothing.", usable)
+        usable, locked, stuff = describe_supplies([])
+        self.assertIn("(usable): nothing.", usable)
         self.assertIn("allow_items: nothing.", locked)
+        self.assertIn("no wood or steel; stone blocks: none", stuff)
 
 
 class BuildingTests(unittest.TestCase):

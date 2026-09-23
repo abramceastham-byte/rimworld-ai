@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from rimagent.construction import Rect
 from rimagent.memory import MemoryUpdate
 
-MAX_ACTIONS = 5
+MAX_ACTIONS = 10
 
 
 class BaseAction(BaseModel):
@@ -102,6 +102,8 @@ class BuildRoom(RectAction):
     action: Literal["build_room"]
     stuff: str
     door_side: Literal["north", "east", "south", "west"]
+    # What the room is for; tracked so later prompts say what it still needs.
+    purpose: Literal["bedroom", "barracks", "kitchen", "dining", "workshop", "storage", "hospital", "other"]
 
 
 class SetResearch(BaseAction):
@@ -130,7 +132,8 @@ Action = Annotated[
 
 
 class Turn(BaseModel):
-    """One reply: up to MAX_ACTIONS orders, carried out in order while the game
+    """One reply: up to MAX_ACTIONS orders, each carried out in order (a failure
+    doesn't stop the rest) while the game
     is paused, then a choice of whether game time runs before the next turn.
 
     Time is chosen every turn, so no pause state can be forgotten. It comes

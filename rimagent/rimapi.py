@@ -21,7 +21,7 @@ from rimagent.construction import (
     MAX_FLOOR_CELLS,
     MAX_WALL_RUN,
     MAX_CHOP_TREES,
-    MAX_DESIGNATE_CELLS,
+    MAX_MINE_CELLS,
     MAX_ZONE_CELLS,
     Rect,
     TerrainInfo,
@@ -177,7 +177,7 @@ class ResearchProject(BaseModel):
     tech_level: str = ""
     can_start_now: bool = False
     is_finished: bool = False
-    progress_percent: float = 0
+    progress_percent: float = 0  # a 0-1 fraction despite the name (RimWorld's ProgressPercent)
     prerequisites: list[str] = Field(default_factory=list)
     # True when the colony has a bench able to research this project. The
     # /research/progress placeholder for "nothing being researched" always says
@@ -325,10 +325,11 @@ def _corners(rect: Rect) -> dict[str, dict[str, int]]:
     }
 
 
-def _check_rect(rect: Rect, terrain: TerrainMap, max_cells: int) -> None:
+def _check_rect(rect: Rect, terrain: TerrainMap, max_cells: int | None = None) -> None:
+    """The rectangle must lie on the map, and hold at most max_cells if given."""
     if not rect.within(terrain.width, terrain.height):
         raise ValueError(f"{rect} is outside the {terrain.width}x{terrain.height} map")
-    if rect.cells > max_cells:
+    if max_cells is not None and rect.cells > max_cells:
         raise ValueError(f"{rect} is {rect.cells} cells; the limit is {max_cells}")
 
 
@@ -913,6 +914,13 @@ class RimApiClient:
                              f"{', '.join(BUILDINGS['Wall'].materials())}")
         terrain = self.get_terrain(map_id)
         _check_rect(rect, terrain, MAX_ZONE_CELLS)
+        # A closed room gets roofed, and crops under a roof get no sunlight.
+        inside = Rect(rect.x1 + 1, rect.z1 + 1, rect.x2 - 1, rect.z2 - 1)
+        field = next((z for z in self.check_area(inside, map_id).zones if z.zone_type == "Growing"), None)
+        if field:
+            raise ValueError(f"room {rect} would enclose a growing zone ({field.label or 'a field'} at "
+                             f"({field.x},{field.z})): the game roofs a closed room and crops under a roof "
+                             "get no sunlight; nothing was placed")
 
         # The four sides as straight strips, so a building inside the room
         # doesn't trigger a cell-by-cell check of the whole interior.
@@ -924,17 +932,34 @@ class RimApiClient:
             blocked.update(self._blocked_cells(side, map_id))
             rock |= {(i.x, i.z) for i in self.check_area(side, map_id).ores}
         wanted = {(x, z): name for name, x, z in layout}
-        reused, refused = [], {}
+        door_cell = next((x, z) for name, x, z in layout if name == "Door")
+
+        def has(here: set[str], name: str) -> bool:  # built, being built, or planned
+            return bool(here & {name, f"Blueprint_{name}", f"Frame_{name}"})
+
+        reused, refused, doors_kept = [], {}, 0
+        wall_on_door_cell = None
         for cell, why in blocked.items():
             here = {t.def_name for t in self.get_things_at(*cell, map_id)}
-            name = wanted[cell]
-            if here & {name, f"Blueprint_{name}", f"Frame_{name}"} or (name == "Wall" and cell in rock):
+            if has(here, "Door"):  # any door in the ring is a way in
                 reused.append(cell)
+                doors_kept += 1
+            elif wanted[cell] == "Wall" and (has(here, "Wall") or cell in rock):
+                reused.append(cell)
+            elif cell == door_cell and (has(here, "Wall") or cell in rock):
+                wall_on_door_cell = (cell, why)
             else:
                 refused[cell] = why
+        door_hint = ""
+        if wall_on_door_cell and not doors_kept:
+            (x, z), why = wall_on_door_cell
+            refused[(x, z)] = why
+            door_hint = f" (({x},{z}) is where the {door_side} door goes: choose another door_side)"
+        elif wall_on_door_cell:  # the ring already has a door; keep the wall
+            reused.append(wall_on_door_cell[0])
         if refused:
             raise ValueError(f"room {rect} is blocked on its perimeter: "
-                             f"{AreaCheck.describe_cells(refused)}; nothing was placed")
+                             f"{AreaCheck.describe_cells(refused)}{door_hint}; nothing was placed")
 
         todo = [(name, x, z) for name, x, z in layout if (x, z) not in reused]
         walls = sum(1 for name, _, _ in todo if name == "Wall")
@@ -1003,10 +1028,10 @@ class RimApiClient:
         self, kind: Literal["mine", "harvest", "hunt"], rect: Rect, map_id: int = 0
     ) -> None:
         """Mark everything of one kind in a rectangle: rock to mine, ripe plants
-        to harvest, or wild animals to hunt."""
+        to harvest, or wild animals to hunt. Only mining is limited in size."""
         if kind not in DESIGNATIONS:
             raise ValueError(f"designation must be one of: {', '.join(DESIGNATIONS)}")
-        _check_rect(rect, self.get_terrain(map_id), MAX_DESIGNATE_CELLS)
+        _check_rect(rect, self.get_terrain(map_id), MAX_MINE_CELLS if kind == "mine" else None)
         self._request(
             "POST",
             "/api/v1/order/designate/area",
@@ -1018,6 +1043,18 @@ class RimApiClient:
         return [MapThing.model_validate(t) for t in self._request(
             "GET", "/api/v1/map/things", params={"map_id": map_id}
         )]
+
+    def get_stored_items(self, map_id: int = 0) -> list[MapThing]:
+        """Items in stockpiles and shelves: what RimWorld's resource readout counts.
+
+        RIMAPI also returns things held inside buildings: at position -1000,
+        left out here, or (material already delivered to a frame) at their
+        old position, and plants growing in stockpile cells. Match against
+        get_items() to keep only real, loose items (supplies.describe_supplies).
+        """
+        data = self._request("GET", "/api/v1/resources/stored", params={"map_id": map_id}) or {}
+        return [MapThing.model_validate(t) for things in data.values() for t in things
+                if t.get("position", {}).get("x", -1) >= 0]
 
     def get_plants(self, map_id: int = 0) -> list[dict]:
         """Every plant on the map (~28,000, about 7 MB), cached for one snapshot.
@@ -1061,11 +1098,11 @@ class RimApiClient:
     def allow_items(self, rect: Rect, map_id: int = 0) -> int:
         """Unforbid every forbidden item in a rectangle so colonists can use it.
 
-        Returns how many items were allowed. Limited to a rectangle because
-        forbidden items are scattered across the whole map, some of them near
+        Returns how many items were allowed. Any rectangle on the map: a
+        rectangle rather than everything, since forbidden items can lie near
         dangers the colonists shouldn't walk into.
         """
-        _check_rect(rect, self.get_terrain(map_id), MAX_DESIGNATE_CELLS)
+        _check_rect(rect, self.get_terrain(map_id))
         ids = [
             t.thing_id for t in self.get_items(map_id)
             if t.is_forbidden and rect.contains(t.position.x, t.position.z)
@@ -1079,29 +1116,33 @@ class RimApiClient:
         )
         return len(ids)
 
-    def chop_trees(self, rect: Rect, map_id: int = 0) -> int:
-        """Mark the trees in a rectangle for cutting, for wood.
+    def chop_trees(self, rect: Rect, map_id: int = 0,
+                   skip: set[int] | frozenset[int] = frozenset()) -> tuple[list[MapThing], int]:
+        """Order the trees in a rectangle cut, for wood.
 
         RIMAPI has no chop order, and its "harvest" designation marks every ripe
-        plant in an area, crops included. So this marks each tree's own cell.
-        At most MAX_CHOP_TREES, nearest the middle of the rectangle first.
-        Trees too young to give wood are skipped by the game.
-        Returns how many trees were marked.
+        plant in an area, crops included. So this marks each tree's own cell,
+        one request per tree: at most MAX_CHOP_TREES, nearest the middle of the
+        rectangle first. Trees in skip (already ordered) are left alone. The
+        rectangle can be any size on the map. The game silently ignores trees
+        too young to give wood; RIMAPI doesn't say which.
+        Returns (trees ordered now, trees in the rectangle).
         """
-        _check_rect(rect, self.get_terrain(map_id), MAX_DESIGNATE_CELLS)
+        _check_rect(rect, self.get_terrain(map_id))
         trees = [t for t in self.get_trees(map_id) if rect.contains(t.position.x, t.position.z)]
         if not trees:
             raise ValueError(f"there are no trees in {rect}")
         cx, cz = (rect.x1 + rect.x2) / 2, (rect.z1 + rect.z2) / 2
-        trees.sort(key=lambda t: (t.position.x - cx) ** 2 + (t.position.z - cz) ** 2)
-        for tree in trees[:MAX_CHOP_TREES]:
+        todo = sorted((t for t in trees if t.thing_id not in skip),
+                      key=lambda t: (t.position.x - cx) ** 2 + (t.position.z - cz) ** 2)[:MAX_CHOP_TREES]
+        for tree in todo:
             cell = Rect(tree.position.x, tree.position.z, tree.position.x, tree.position.z)
             self._request(
                 "POST",
                 "/api/v1/order/designate/area",
                 json={"map_id": map_id, "type": "harvest", **_corners(cell)},
             )
-        return min(len(trees), MAX_CHOP_TREES)
+        return todo, len(trees)
 
     def start_game(
         self,

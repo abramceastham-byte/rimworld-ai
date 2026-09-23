@@ -49,7 +49,8 @@ resumes the game, checking each step took effect.
 
 The agent stores durable, model-proposed memory under `memory/`:
 
-- `observations.md` is an append-only playthrough notebook.
+- `observations.md` keeps big discoveries and ideas for the whole playthrough ("colonists are
+  happier with a bedroom each"), not a diary of turns; the prompt asks for exactly that.
 - `state.json` contains the current plan, non-live statuses, and policies.
 
 Live facts already read from RIMAPI (game state, colonists, alerts, threats,
@@ -96,17 +97,19 @@ creating a duplicate. Bill deletion is intentionally not exposed to the model.
 
 ## What the model sees and does each step
 
-A reply is a **turn**: 0 to 5 orders, then a time choice:
+A reply is a **turn**: 0 to 10 orders, then a time choice:
 
 ```json
 {"actions": [{"action": "build_room", "x1": 111, "z1": 116, "x2": 116, "z2": 120,
-              "stuff": "WoodLog", "door_side": "north", "reason": "A bedroom."}],
+              "stuff": "WoodLog", "door_side": "north", "purpose": "bedroom",
+              "reason": "A bedroom."}],
  "time": "advance"}
 ```
 
 The orders run in order while the game is paused, each against freshly read
-state. The first failure stops the rest of the turn (later orders often depend
-on it); they are reported as skipped. Every result says what really happened:
+state. Every order is tried, even after one fails: the game refuses one that
+relied on a failed order, and the next prompt reports each by number as OK,
+UNCHANGED or FAILED, with a count. Every result says what really happened:
 `unchanged` when the game already matched, `verified` when a re-read confirmed
 it, or `submitted` when RIMAPI can't confirm it (designations, tree chopping).
 Failures stay in the prompt, up to six, until the state they depended on
@@ -125,21 +128,68 @@ the same choices after decoding. Schema branches enforce table/recipe,
 colonist/work and building/material pairs; recipe reads request only unlocked
 recipes. Runtime checks also enforce geometry, including single-cell hunting.
 
-The prompt includes a mini-map around the colony showing terrain, colonists,
-trees, forbidden items, **the colony's own buildings, frames and blueprints**,
-plus what supplies are **usable now versus forbidden** (so "no usable Steel" is
-visible before it plans a steel building), and the live status of every
-blueprint it placed.
+**Every result carries a hint** (`rimagent/hints.py`), drawn from what the turn
+observed. A failure says what to do instead: a free spot that fits, the nearest
+targets, who can do the work. A failure caused by the colony's own blueprint
+says it is the model's own and nothing needs fixing, and isn't kept in the
+prompt as "unresolved". Without that, a model read its own blueprint as a
+conflict, "repositioned" it by placing another, and planned twenty
+stonecutter's tables. A construction order that works says which copy it is,
+what it costs against what the other unfinished builds already claim, and who
+builds it. Work tables, stoves, the research bench and generators can't be
+placed again while another of the same kind is still unbuilt.
 
-Plan and policy changes in a reply are **ignored when one of its actions
-failed** (`honest_memory_update`), since a failed action changes nothing; the
-reply's observation is still kept. Each run log records the full prompt with the
+**Standing hints** join the results at the top of the prompt: when colonists
+have wandered or idled for two turns in a row (pending work against who has it
+on, and what the idle ones could take), and when the stockpiles are 90% full or
+more (make another stockpile, or build shelves).
+
+**Open areas avoid zones RIMAPI won't locate.** Its area check names one cell
+per zone, so a reported zone rules out the whole square it could cover (from
+its cell count in `/map/zones`), and an area is offered only once a check finds
+nothing in it.
+
+**Rooms have a purpose.** `build_room` takes `purpose` (bedroom, barracks,
+kitchen, dining, workshop, storage, hospital, other), recorded in
+`memory/rooms.json`. Each turn the prompt lists the rooms with how many wall
+cells stand, what is inside, and what the purpose still needs (a bedroom
+without a bed). A room that would enclose a growing zone is refused: the game
+roofs a closed room, and crops under a roof get no sunlight.
+
+**Orders are standing orders.** The prompt tells the model it manages the
+colony, and colonists carry out what is already in effect by themselves while
+time advances. Orders already in effect aren't offered again: the current
+research project drops out of `set_research`, and `enable_work` /
+`disable_work` only offer work that is off / on for that colonist. The research
+line says the project carries on by itself and who has Research on.
+
+The prompt includes a mini-map around the colony showing terrain, colonists,
+trees, forbidden items, the colony's own buildings, frames and blueprints, and
+the live status of every blueprint it placed, grouped so a room reads as one
+line. Supplies are split the way a player sees them: the **colony stock** in
+stockpiles and shelves (RimWorld's resource readout), allowed items lying
+elsewhere (still usable), and forbidden ones. **Building materials** are listed
+on their own. Stone chunks are called out as *not* a material, with the
+stonecutter's table and bill that turn them into blocks, and only materials the
+colony actually has are offered as `stuff`. A construction order that the
+colony can't pay for succeeds with a warning saying what is missing and how to
+get it.
+
+Plan and policy changes in a reply are always kept, whatever its orders did. A
+plan step (or the whole plan) newly marked **completed is held as in_progress
+until a later turn confirms it** (`memory.held_until_confirmed`): models mark a
+step done in the same reply that sends its orders, before the game has done
+anything. If the next reply still says completed, having seen fresh game state,
+it stands; the prompt marks a held step "you reported it done: mark it completed
+again once the game shows it". Each run log records the full prompt with the
 first action of every turn.
 
 ## Zones, blueprints and designations
 
 Each step's prompt includes colonist positions, a terrain mini-map around the
-colony, free spots checked against the game, existing zones and buildings, and
+colony, up to five open areas near the base (the biggest clear rectangles, up to
+15x15, checked against the game; the model may use any part of one), existing
+zones and buildings, and
 the buildings, floors and crops it may use.
 
 | Action | What it does | Limits |
@@ -147,12 +197,12 @@ the buildings, floors and crops it may use.
 | `create_growing_zone` | Plants one crop in a rectangle | 225 cells; every cell fertile enough for the crop; food/fibre crops only |
 | `create_stockpile` | Storage for all normal items | 225 cells; not on water or marsh |
 | `place_blueprint` | One building for colonists to construct | Catalog buildings only, research finished, valid material, no overlap with an existing blueprint or frame |
-| `build_room` | A closed ring of walls with one centred door, in one request | 4-15 cells a side; only the perimeter must be clear; walls or rock already on it are kept; anything else refuses the whole room |
+| `build_room` | A closed ring of walls with one centred door, in one request | 4-15 cells a side, outer (a 4x4 room is 2x2 inside); only the perimeter must be clear; walls, doors or rock already on it are kept; anything else refuses the whole room |
 | `build_wall` | A straight run of walls; taken cells are skipped and named | 20 cells |
 | `build_floor` | Flooring over a rectangle; floored or planned cells are skipped | 225 cells; stone tiles need Stonecutting |
-| `designate` | Mine rock or harvest ripe plants in a rectangle; hunt at one animal cell | 400 cells for mine/harvest; hunt requires x1=x2 and z1=z2. Only offered with observed targets |
-| `allow_items` | Unforbid the items in a rectangle | 400 cells |
-| `chop_trees` | Mark the trees in a rectangle for cutting | 30 trees |
+| `designate` | Mine rock or harvest ripe plants in a rectangle; hunt at one animal cell | Mine: 400 cells (a bigger box would send colonists into the whole mountain). Harvest: any size. Hunt: one animal cell, x1=x2 and z1=z2. Only offered with observed targets |
+| `allow_items` | Unforbid the items in a rectangle | Any size on the map |
+| `chop_trees` | Order the trees in a rectangle cut | Any size; the 30 trees nearest its centre per order (one request each). Trees already ordered are skipped, so repeating an order reports `unchanged` |
 
 RIMAPI does little checking of its own here (unknown names are skipped while it
 still reports success, and blueprints skip RimWorld's placement checks), so the
@@ -176,6 +226,22 @@ Two RIMAPI quirks the client works around, worth reporting upstream:
   position from `GET /map/pawns` instead.
 - `GET /map/plants?def_name=` still scans every plant, so one unfiltered read
   (about 0.6 s) is cheaper than one per tree species (about 8 s for 26).
+- `GET /map/farm/summary` sends each crop's `growth_progress_average` as the
+  sum of its plants' growth, so the client divides by the plant count; its
+  `days_until_harvest` is always 0 and is ignored.
+- `GET /resources/stored` also returns plants growing in stockpile cells and
+  material already delivered into frames (at its old position), so the client
+  only counts stored things that are also loose items in `GET /map/things`.
+- `progress_percent` in `GET /research/progress` is a 0-1 fraction, not a
+  percentage, so research looked stuck at "0%" until the client fixed it.
+- `GET /map/zone/growing` reads `map_id` as the zone id, so it can't look up a
+  zone; per-crop figures come from the farm summary instead.
+
+**Tree cutting is tracked** in `memory/chops.json`. RIMAPI's harvest order
+silently skips trees too young for wood and reports success without a count,
+so the agent remembers which trees it ordered cut and checks them each turn:
+the prompt says how many fell, how many still stand, which have stood 2+
+in-game hours (most likely too young), and who has PlantCutting on.
 
 Tests: `python -m unittest discover -s tests`
 
@@ -215,8 +281,9 @@ python -m scripts.run_agent --model qwen3:14b --think on --steps 20
 **Every turn chooses time.** The game is always paused while the model decides
 and while its orders run. Then:
 
-- **advance:** the game runs for `--run-seconds` of *game* time (default 10,
-  measured at normal speed), or `--threat-run-seconds` (default 3) while a
+- **advance:** the game runs for `--run-seconds` of *game* time (default 48,
+  measured at normal speed: 2,880 ticks, 1.15 in-game hours, 8 real seconds at
+  speed 3), or `--threat-run-seconds` (default 14.4) while a
   threat is active, then pauses for the next turn. The window is counted in game
   ticks, so `--speed` only changes how long you wait: RimWorld runs 60 ticks/s
   at speed 1, 180 at speed 2 and 360 at speed 3, so `--run-seconds 15 --speed 2`

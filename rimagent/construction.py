@@ -10,10 +10,13 @@ Building sizes, materials and research come from RimWorld 1.6's own def files.
 
 from dataclasses import dataclass
 
-# Largest rectangle the agent may turn into one zone, and may designate at once.
+# Largest rectangle the agent may turn into one zone.
 MAX_ZONE_CELLS = 15 * 15
-MAX_DESIGNATE_CELLS = 20 * 20
-MAX_CHOP_TREES = 30       # trees marked by one chop_trees action
+# Mining is the one area order left bounded: a map-wide box would send the
+# colonists into the whole mountain. allow_items, harvest and chop_trees take
+# any rectangle on the map, so nothing a few cells outside a box is missed.
+MAX_MINE_CELLS = 20 * 20
+MAX_CHOP_TREES = 30       # trees marked by one chop_trees action (one request each)
 MAX_WALL_RUN = 20         # cells in one straight wall run
 MAX_FLOOR_CELLS = 15 * 15  # cells floored by one action
 
@@ -33,6 +36,19 @@ STUFF_BY_CATEGORY = {
     "Metallic": ["Steel"],
     "Stony": ["BlocksGranite", "BlocksSandstone", "BlocksLimestone", "BlocksSlate", "BlocksMarble"],
 }
+# Order materials are offered in, preferred first. RimWorld lists Metallic
+# first, and a model shown "Steel/WoodLog/..." everywhere built rooms and
+# benches in steel, which doesn't regrow and is needed for components,
+# machines and weapons. Wood regrows; stone blocks are fireproof.
+STUFF_PREFERENCE = ("Woody", "Stony", "Metallic")
+
+
+def stuff_rank(material: str | None) -> int:
+    """Sort key putting preferred materials first (None, for fixed-cost, last)."""
+    for rank, category in enumerate(STUFF_PREFERENCE):
+        if material in STUFF_BY_CATEGORY.get(category, ()):
+            return rank
+    return len(STUFF_PREFERENCE)
 
 
 @dataclass(frozen=True)
@@ -44,15 +60,19 @@ class BuildSpec:
     cost: tuple[tuple[str, int], ...] = ()    # fixed extra cost, e.g. (("Steel", 25),)
     research: str | None = None               # research project that unlocks it
 
+    def categories(self) -> list[str]:
+        """This building's stuff categories, preferred first (see STUFF_PREFERENCE)."""
+        return sorted(self.stuff, key=lambda c: STUFF_PREFERENCE.index(c) if c in STUFF_PREFERENCE else 9)
+
     def materials(self) -> list[str]:
-        return [m for category in self.stuff for m in STUFF_BY_CATEGORY.get(category, [])]
+        return [m for category in self.categories() for m in STUFF_BY_CATEGORY.get(category, [])]
 
     def cost_text(self) -> str:
-        """What it takes to build, e.g. "75 of WoodLog/Steel/stone blocks + 25 Steel"."""
+        """What it takes to build, e.g. "75 of WoodLog/stone blocks/Steel + 25 Steel"."""
         parts = []
         if self.stuff_count:
             kinds = "/".join(
-                "stone blocks" if c == "Stony" else STUFF_BY_CATEGORY[c][0] for c in self.stuff
+                "stone blocks" if c == "Stony" else STUFF_BY_CATEGORY[c][0] for c in self.categories()
             )
             parts.append(f"{self.stuff_count} of {kinds}")
         parts += [f"{count} {name}" for name, count in self.cost]
@@ -184,7 +204,8 @@ def footprint(x: int, z: int, size: tuple[int, int], rotation: int) -> Rect:
 def room_layout(rect: Rect, door_side: str) -> list[tuple[str, int, int]]:
     """Outer walls with exactly one centred door, no duplicate corner cells."""
     if not (4 <= rect.x2 - rect.x1 + 1 <= 15 and 4 <= rect.z2 - rect.z1 + 1 <= 15):
-        raise ValueError("room outer dimensions must each be 4..15 cells")
+        raise ValueError("room outer dimensions must each be 4..15 cells, walls included: "
+                         "outer 4x4 leaves 2x2 inside, outer 5x5 leaves 3x3")
     mx, mz = (rect.x1 + rect.x2) // 2, (rect.z1 + rect.z2) // 2
     doors = {"north": (mx, rect.z2), "south": (mx, rect.z1),
              "east": (rect.x2, mz), "west": (rect.x1, mz)}

@@ -47,6 +47,42 @@ class PersistentMemoryState(BaseModel):
     current_plan: CurrentPlan | None = None
     statuses: dict[str, str] = Field(default_factory=dict)
     policies: list[str] = Field(default_factory=list)
+    # Plan steps (and PLAN_KEY for the whole plan) reported completed last
+    # turn, held as in_progress until a later reply confirms them.
+    unconfirmed: list[str] = Field(default_factory=list)
+
+
+PLAN_KEY = "(the whole plan)"
+
+
+def held_until_confirmed(plan: CurrentPlan, previous: CurrentPlan | None,
+                         unconfirmed: list[str]) -> tuple[CurrentPlan, list[str]]:
+    """Accept a step's "completed" only on a later turn than the one it is claimed in.
+
+    Models mark a step completed in the same reply that sends its orders,
+    before the game has done anything. A newly completed step is therefore
+    kept as in_progress and remembered; if the next reply still says
+    completed, the model has seen fresh game state since, and it stands.
+    The rest of the plan is always kept, whatever happened to the orders.
+    Returns the plan to store and the claims still awaiting confirmation.
+    """
+    done_before = {s.description.casefold() for s in (previous.steps if previous else [])
+                   if s.status == "completed"}
+    claimed = {c.casefold() for c in unconfirmed}
+    waiting: list[str] = []
+    steps = []
+    for step in plan.steps:
+        key = step.description.casefold()
+        if step.status == "completed" and key not in done_before and key not in claimed:
+            waiting.append(step.description)
+            step = step.model_copy(update={"status": "in_progress"})
+        steps.append(step)
+    status = plan.status
+    plan_done_before = previous is not None and previous.status == "completed"
+    if status == "completed" and not plan_done_before and PLAN_KEY.casefold() not in claimed:
+        waiting.append(PLAN_KEY)
+        status = "active"
+    return plan.model_copy(update={"steps": steps, "status": status}), waiting
 
 
 class DecisionMemoryEntry(BaseModel):
@@ -100,9 +136,9 @@ class AgentMemory:
     def _ensure_observations_file(self) -> None:
         if not self.observations_path.exists():
             self.observations_path.write_text(
-                "# Agent observations\n\n"
-                "Durable observations from this playthrough. Live RIMAPI telemetry "
-                "is intentionally not copied here.\n",
+                "# Discoveries and ideas\n\n"
+                "Big lessons from this playthrough about the colony and how RimWorld works. "
+                "Live telemetry and turn-by-turn events are intentionally not kept here.\n",
                 encoding="utf-8",
             )
 
@@ -144,8 +180,10 @@ class AgentMemory:
 
         if update.clear_plan:
             self.state.current_plan = None
+            self.state.unconfirmed = []
         elif update.replace_plan is not None:
-            self.state.current_plan = update.replace_plan
+            self.state.current_plan, self.state.unconfirmed = held_until_confirmed(
+                update.replace_plan, self.state.current_plan, self.state.unconfirmed)
 
         for key in update.clear_statuses:
             self.state.statuses.pop(key.strip(), None)
@@ -200,9 +238,13 @@ class AgentMemory:
         plan = self.state.current_plan
         lines = ["Agent memory (intentions, not proof of outcomes):"]
         if plan:
-            lines.append(f"Objective: {plan.objective} [{plan.status}]")
-            lines.extend(f"- {step.status}: {step.description}" for step in plan.steps
-                         if step.status not in ("completed", "abandoned"))
+            waiting = {c.casefold() for c in self.state.unconfirmed}
+            note = " (you reported it done: mark it completed again once the game shows it)"
+            lines.append(f"Objective: {plan.objective} [{plan.status}]"
+                         + (note if PLAN_KEY.casefold() in waiting else ""))
+            lines.extend(f"- {step.status}: {step.description}"
+                         + (note if step.description.casefold() in waiting else "")
+                         for step in plan.steps if step.status not in ("completed", "abandoned"))
         if self.state.policies:
             lines.append("Policies: " + "; ".join(self.state.policies[-6:]))
         if self.state.statuses:

@@ -57,11 +57,19 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(self.client(FakeResearch(projects=no_bench)).get_research().has_bench)
 
     def test_current_project(self) -> None:
-        working = {"name": "Brewing", "label": "beer brewing", "progress_percent": 40.0,
+        # As RIMAPI sends it: progress_percent is a 0-1 fraction, progress in points.
+        working = {"name": "Brewing", "label": "beer brewing", "progress_percent": 0.4,
+                   "progress": 160, "research_points": 400,
                    "player_has_any_appropriate_research_bench": True}
         state = self.client(FakeResearch(progress=working)).get_research()
         self.assertEqual(state.current.label, "beer brewing")
-        self.assertIn("Researching beer brewing (40% done).", describe_research(state))
+        now, others = describe_research(state, ["Benitez"])
+        self.assertIn("Researching beer brewing (40% done, 160 of 400 points). This is a standing order", now)
+        self.assertIn("worked on by colonists with Research on: Benitez.", now)
+        self.assertTrue(others.startswith("Could switch to:"))
+        self.assertNotIn("Brewing (", others)  # the current project isn't offered again
+        stalled, _ = describe_research(state, [])
+        self.assertIn("nobody has Research on, so it is stalled: enable_work Research", stalled)
 
     def test_starting_a_project(self) -> None:
         fake = FakeResearch()

@@ -299,7 +299,8 @@ class ChopTreesTests(MapTestCase):
             thing(12, "Plant_TreePoplar", 4, 4),
             thing(13, "Plant_TreeOak", 8, 8),     # outside
         ])
-        self.assertEqual(self.client_with(fake).chop_trees(Rect(1, 1, 5, 5)), 2)
+        done, total = self.client_with(fake).chop_trees(Rect(1, 1, 5, 5))
+        self.assertEqual((len(done), total), (2, 2))
         cells = [c[2]["json"]["point_a"] for c in fake.writes()]
         self.assertCountEqual(cells, [{"x": 2, "y": 0, "z": 2}, {"x": 4, "y": 0, "z": 4}])
         for _, path, kwargs in fake.writes():
@@ -311,7 +312,8 @@ class ChopTreesTests(MapTestCase):
         plants = [thing(100 + i, "Plant_TreeOak", x, z) for i, (x, z) in
                   enumerate((x, z) for x in range(9) for z in range(9))]  # 81 trees
         fake = FakeRimApi(plants=plants)
-        self.assertEqual(self.client_with(fake).chop_trees(Rect(0, 0, 8, 8)), 30)
+        done, total = self.client_with(fake).chop_trees(Rect(0, 0, 8, 8))
+        self.assertEqual((len(done), total), (30, 81))  # 30 of 81
         self.assertEqual(len(fake.writes()), 30)
         first = fake.writes()[0][2]["json"]["point_a"]
         self.assertEqual((first["x"], first["z"]), (4, 4))  # the middle

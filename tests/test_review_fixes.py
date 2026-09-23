@@ -33,12 +33,13 @@ class PairingTests(MapTestCase):
     def test_schema_allows_only_valid_pairs(self):
         c = self.choices()
         c.work = {'Ada': {'Construction'}, 'Bob': {'Research'}}
+        c.can_enable = c.work  # enable pairs come from work that is off
         c.fields['enable_work'] = {'colonist': list(c.work), 'work_type': ['Construction', 'Research']}
         c.recipes = {1: {'Meal'}, 2: {'Shirt'}}
         c.fields['set_bill'] = {'building_id': [1, 2], 'recipe_def_name': ['Meal', 'Shirt']}
         branches = c.schema()['properties']['actions']['items']['anyOf']
         for action, selector, dependent, mapping in [
-            ('enable_work', 'colonist', 'work_type', c.work),
+            ('enable_work', 'colonist', 'work_type', c.can_enable),
             ('set_bill', 'building_id', 'recipe_def_name', c.recipes),
             ('place_blueprint', 'building_def', 'stuff', c.materials),
         ]:

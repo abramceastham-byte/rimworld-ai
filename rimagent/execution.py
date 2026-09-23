@@ -3,15 +3,17 @@
 import json
 
 from rimagent.choices import action_target, incapable_work
+from rimagent.hints import ONE_AT_A_TIME
 from rimagent.rimapi import RimApiError
 
 
-def execute(client, action, blueprints, zones, operations, learned_incapable=None):
+def execute(client, action, blueprints, zones, operations, learned_incapable=None, chops=None):
     """Carry out one order against freshly read state, and say what it did.
 
     Returns "unchanged: ..." when the game already matches, or what was
     verified or merely submitted. Raises ValueError/RimApiError on failure.
-    learned_incapable collects work RIMAPI refused, for later turns' choices.
+    learned_incapable collects work RIMAPI refused, for later turns' choices;
+    chops (a ChopTracker) remembers which trees were ordered cut.
     Does not advance the game clock.
     """
     client.begin_snapshot()
@@ -26,7 +28,9 @@ def execute(client, action, blueprints, zones, operations, learned_incapable=Non
         enabled = any(w.work_type == action.work_type and w.priority > 0 for w in pawn.work_priorities)
         wanted = kind == "enable_work"
         if enabled == wanted:
-            return f"unchanged: {target} already {'enabled' if wanted else 'disabled'}"
+            return (f"unchanged: {target} already {'enabled' if wanted else 'disabled'}"
+                    + ("; asking again does nothing: if that work isn't getting done, look for "
+                       "missing materials, too little time advanced, or more urgent jobs" if wanted else ""))
         if wanted and action.work_type in incapable_work(pawn, learned_incapable):
             raise ValueError(f"{pawn.name} is incapable of {action.work_type}")
         try:
@@ -46,7 +50,8 @@ def execute(client, action, blueprints, zones, operations, learned_incapable=Non
     elif kind == "set_research":
         detail = client.set_research(action.project)
         if detail.startswith("unchanged"):
-            return f"{target}: {detail}"
+            return (f"{target}: {detail}; it carries on by itself while time advances, "
+                    "so asking again does nothing")
         current = client.get_research().current
         if not current or current.name != action.project:
             raise ValueError(f"research selection was not applied: {action.project}")
@@ -95,13 +100,32 @@ def execute(client, action, blueprints, zones, operations, learned_incapable=Non
             raise ValueError(f"allow_items partially applied: {len(remaining)}/{len(before)} still forbidden")
         detail = f"verified {count} stacks allowed"
     elif kind == "chop_trees":
-        count = client.chop_trees(action.rect())
-        detail = f"submitted harvest requests at {count} tree cells; changed count/readiness unavailable; no wood obtained yet"
+        rect = action.rect()
+        tick = client.get_state().game_tick
+        ordered = chops.recent_ids(tick) if chops else set()
+        # Read before ordering: the first order clears the cached tree list.
+        already = sum(1 for t in client.get_trees()
+                      if t.thing_id in ordered and rect.contains(t.position.x, t.position.z))
+        done, total = client.chop_trees(rect, skip=ordered)
+        if not done:
+            return (f"unchanged: {target}: all {total} trees there were already ordered cut; "
+                    "see 'Tree cutting you ordered' for what became of them")
+        if chops:
+            chops.add(done, tick)
+        notes = [f"{already} there were already ordered"] if already else []
+        more = total - already - len(done)
+        if more > 0:
+            notes.append(f"{more} more there beyond the {len(done)} per order: order again for those")
+        detail = (f"ordered {len(done)} trees cut" + (f" ({'; '.join(notes)})" if notes else "")
+                  + "; the game silently skips trees too young for wood, so check next turn "
+                  "whether they fell")
     elif kind == "designate":
         candidates = operations.targets.get(action.designation, [])
         matches = [t for t in candidates if action.rect().contains(t['x'], t['z'])]
         if not matches:
-            raise ValueError(f"no observed {action.designation} candidate in {action.rect()}")
+            trees = sum(1 for t in client.get_trees() if action.rect().contains(t.position.x, t.position.z))
+            hint = f"; it holds {trees} trees: use chop_trees to cut trees" if trees else ""
+            raise ValueError(f"no observed {action.designation} target in {action.rect()}{hint}")
         if action.designation == "hunt":
             # Bound the order to the selected, observed animal. Area hunting can
             # accidentally mark predators or faction animals elsewhere in a box.
@@ -124,6 +148,13 @@ def execute(client, action, blueprints, zones, operations, learned_incapable=Non
         if kind == "place_blueprint" and client.construction_at(
                 action.building_def, action.x, action.z, action.rotation, stuff=action.stuff):
             return f"unchanged: {target} already built or queued; existing materials retained"
+        if kind == "place_blueprint" and action.building_def in ONE_AT_A_TIME and blueprints is not None:
+            waiting = [bp for bp, status in blueprints.check(client, forget_finished=False)
+                       if bp.def_name == action.building_def and status in ("waiting", "under construction")]
+            if waiting:
+                bp = waiting[0]
+                raise ValueError(f"your {bp.def_name} at ({bp.x},{bp.z}) is still unbuilt; a second one "
+                                 "before it stands only doubles the material bill")
         try:
             detail = str(methods[kind]())
         finally:

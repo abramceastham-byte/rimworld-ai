@@ -154,53 +154,91 @@ def block_mark(block: Rect, terrain, defs_terrain: dict[str, TerrainInfo],
     return SOIL
 
 
+MAX_SPOT_SIDE = 15   # the most one order can use (a room's side, a 225-cell zone)
+MIN_SPOT_SIDE = 3
+
+
 def free_spots(anchor: tuple[int, int], terrain, defs_terrain: dict[str, TerrainInfo],
-               occupied: set[tuple[int, int]], radius: int = 20,
-               wanted: tuple[tuple[int, int], ...] = ((3, 3), (5, 5), (7, 5)),
-               is_clear: Callable[[Rect], bool] | None = None,
-               max_checks: int = 8) -> list[tuple[str, Rect, str]]:
-    """Rectangles near the base with nothing in the way, as lettered options.
+               occupied: set[tuple[int, int]], radius: int = 20, count: int = 5,
+               blocked_in: Callable[[Rect], set[tuple[int, int]]] | None = None,
+               max_checks: int = 20) -> list[tuple[str, Rect, str]]:
+    """The biggest open rectangles near the base, as lettered options.
 
     Saves the model from picking coordinates off the grid, which is where it
-    goes wrong most often. is_clear, when given, asks the game about each
-    candidate, nearest first (up to max_checks per size): zones whose cells
-    aren't known locally, rock and buildings only show up there.
+    goes wrong most often. Each is the largest clear rectangle left (at most
+    MAX_SPOT_SIDE a side), favouring ones nearer the base; the model may use
+    all of one or any part. blocked_in, when given, asks the game what is in a
+    candidate (zones not known locally, rock, buildings); cells it returns are
+    ruled out (they may reach beyond the candidate) and the search runs again,
+    up to max_checks asks in all. Only a candidate it finds nothing in is offered.
     """
     cx, cz = anchor
     x1, z1 = max(0, cx - radius), max(0, cz - radius)
     x2, z2 = min(terrain.width - 1, cx + radius), min(terrain.height - 1, cz + radius)
-
-    def usable(x: int, z: int) -> TerrainInfo | None:
-        info = defs_terrain.get(terrain.at(x, z))
-        if info is None or (x, z) in occupied or "Heavy" not in info.affordances:
-            return None
-        return info
+    info_at: dict[tuple[int, int], TerrainInfo] = {}
+    for x in range(x1, x2 + 1):
+        for z in range(z1, z2 + 1):
+            info = defs_terrain.get(terrain.at(x, z))
+            if info is not None and "Heavy" in info.affordances and (x, z) not in occupied:
+                info_at[(x, z)] = info
 
     found: list[tuple[str, Rect, str]] = []
-    taken: list[Rect] = []
-    for width, depth in wanted:
-        candidates: list[tuple[int, Rect, float]] = []
-        for z in range(z1, z2 - depth + 2):
-            for x in range(x1, x2 - width + 2):
-                rect = Rect(x, z, x + width - 1, z + depth - 1)
-                infos = [usable(cx_, cz_) for cx_, cz_ in rect]
-                if any(i is None for i in infos) or any(rect.overlaps(t) for t in taken):
-                    continue
-                distance = abs(x + width // 2 - cx) + abs(z + depth // 2 - cz)
-                candidates.append((distance, rect, min(i.fertility for i in infos if i)))
-        candidates.sort(key=lambda c: c[0])
-        checked: list[Rect] = []  # refused ones, so a neighbour one cell over isn't asked again
-        for _, rect, fertility in candidates:
-            if is_clear is not None:
-                if len(checked) >= max_checks:
-                    break
-                if any(rect.overlaps(r) for r in checked):
-                    continue
-                if not is_clear(rect):
-                    checked.append(rect)
-                    continue
-            note = "fertile, crops can grow here" if fertility >= 0.7 else "no crops (poor soil)"
-            found.append((chr(ord("A") + len(found)), rect, f"{width}x{depth}, {note}"))
-            taken.append(rect)
+    checks = 0
+    while len(found) < count:
+        rect = biggest_rect(set(info_at), (x1, z1, x2, z2), anchor)
+        if rect is None:
             break
+        if blocked_in is not None:
+            if checks >= max_checks:
+                break
+            checks += 1
+            in_the_way = blocked_in(rect)
+            if in_the_way:
+                if not any(rect.contains(*c) for c in in_the_way):
+                    in_the_way = set(rect)  # reported, but nowhere inside: don't ask about it again
+                for cell in in_the_way:
+                    info_at.pop(cell, None)
+                continue
+        fertile = sum(1 for c in rect if info_at[c].fertility >= 0.7) / rect.cells
+        soil = ("fertile throughout, crops can grow" if fertile == 1 else
+                f"{fertile:.0%} fertile" if fertile >= 0.5 else "poor soil, no crops")
+        steps = abs((rect.x1 + rect.x2) // 2 - cx) + abs((rect.z1 + rect.z2) // 2 - cz)
+        found.append((chr(ord("A") + len(found)), rect,
+                      f"{rect.x2 - rect.x1 + 1}x{rect.z2 - rect.z1 + 1} open, {soil}, {steps} cells from the base"))
+        for cell in rect:
+            info_at.pop(cell, None)
     return found
+
+
+def biggest_rect(free: set[tuple[int, int]], bounds: tuple[int, int, int, int],
+                 anchor: tuple[int, int]) -> Rect | None:
+    """The best clear rectangle within bounds: the largest area (sides capped
+    at MAX_SPOT_SIDE), less a little for distance from the anchor so a big spot
+    next to the base beats a slightly bigger one far away."""
+    x1, z1, x2, z2 = bounds
+    # up[x, z]: free cells in a column starting at (x, z) going north, capped.
+    up: dict[tuple[int, int], int] = {}
+    for x in range(x1, x2 + 1):
+        run = 0
+        for z in range(z2, z1 - 1, -1):
+            run = min(run + 1, MAX_SPOT_SIDE) if (x, z) in free else 0
+            up[(x, z)] = run
+    best, best_score = None, None
+    for z in range(z1, z2 + 1):
+        for x in range(x1, x2 + 1):
+            height = MAX_SPOT_SIDE
+            for width in range(1, MAX_SPOT_SIDE + 1):
+                if x + width - 1 > x2:
+                    break
+                height = min(height, up[(x + width - 1, z)])
+                if height < MIN_SPOT_SIDE:
+                    break
+                if width < MIN_SPOT_SIDE:
+                    continue
+                rect = Rect(x, z, x + width - 1, z + height - 1)
+                centre = ((rect.x1 + rect.x2) / 2, (rect.z1 + rect.z2) / 2)
+                distance = abs(centre[0] - anchor[0]) + abs(centre[1] - anchor[1])
+                score = rect.cells - 2 * distance
+                if best_score is None or score > best_score:
+                    best, best_score = rect, score
+    return best

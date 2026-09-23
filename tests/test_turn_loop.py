@@ -18,6 +18,7 @@ from rimagent.rimapi import (
     AreaCheck,
     Colonist,
     GameState,
+    MapThing,
     RimApiError,
     ResearchProject,
     ResearchState,
@@ -194,8 +195,9 @@ class ChoicesTests(MapTestCase):
         defs = self.client_with(GridFake()).get_game_defs()
         terrain = TerrainMap(WIDTH, HEIGHT, PALETTE, terrain_grid())
         pawn = colonist(skills=[Skill(name="Intellectual", level=0, totally_disabled=True)])
+        wood = MapThing(thing_id=900, def_name="WoodLog", position={"x": 1, "z": 1}, stack_count=200)
         return Choices.observe(colonists or [pawn], WORK_TYPES, [], RESEARCH, defs, terrain,
-                               [], [], (), learned)
+                               [wood], [], (), learned)
 
     def turn(self, *actions) -> Turn:
         return Turn.model_validate({"actions": list(actions), "time": "hold"})
@@ -235,13 +237,13 @@ class ChoicesTests(MapTestCase):
             {"action": "place_blueprint", "building_def": "Wall", "x": 1, "z": 1,
              "stuff": None, "reason": "a wall needs a material"},
             {"action": "build_room", "x1": 2, "z1": 2, "x2": WIDTH, "z2": 6, "stuff": "WoodLog",
-             "door_side": "north", "reason": "off the map"},
+             "door_side": "north", "purpose": "bedroom", "reason": "off the map"},
         ]
         for action in bad:
             with self.subTest(action=action["reason"]), self.assertRaises(ValueError):
                 c.validate(self.turn(action))
         c.validate(self.turn({"action": "build_room", "x1": 2, "z1": 2, "x2": 7, "z2": 6,
-                              "stuff": "WoodLog", "door_side": "north", "reason": "fine"}))
+                              "stuff": "WoodLog", "door_side": "north", "purpose": "bedroom", "reason": "fine"}))
 
     def test_refused_work_is_removed_for_that_colonist(self) -> None:
         c = self.choices(learned={"Ada": {"Growing"}})
@@ -353,9 +355,12 @@ class LoopClient:
     def get_work_tables(self): return []
     def get_research(self): return RESEARCH
     def get_terrain(self, map_id=0): return TerrainMap(WIDTH, HEIGHT, PALETTE, terrain_grid())
-    def get_items(self, map_id=0): return []
+    def get_items(self, map_id=0):  # some wood, so wooden builds are on offer
+        return [MapThing(thing_id=900, def_name="WoodLog", position={"x": 1, "z": 1},
+                         stack_count=200)]
     def get_trees(self, map_id=0): return []
     def get_plants(self, map_id=0): return []
+    def get_stored_items(self, map_id=0): return []
     def get_buildings(self, map_id=0): return []
     def get_zones(self, map_id=0): return []
     def get_things_at(self, x, z, map_id=0): return []
@@ -391,7 +396,7 @@ class ScriptedModel:
 
 
 class RunLoopTests(unittest.TestCase):
-    def test_orders_stop_at_a_failure_and_time_follows_each_choice(self) -> None:
+    def test_every_order_is_tried_and_time_follows_each_choice(self) -> None:
         tmp = Path(tempfile.mkdtemp())
         client = LoopClient()
         model = ScriptedModel([
@@ -405,19 +410,21 @@ class RunLoopTests(unittest.TestCase):
         run(client, model, RunLogger(tmp / "logs"), max_steps=2, run_ticks=60, threat_run_ticks=60,
             memory=AgentMemory(tmp / "memory"))
 
-        # Construction was already on (no write); research failed; Growing was skipped.
+        # Construction was already on (no write); research failed; Growing still ran.
         self.assertIn("research Brewing", client.calls)
         self.assertNotIn("enable Construction", client.calls)
-        self.assertNotIn("enable Growing", client.calls)
+        self.assertIn("enable Growing", client.calls)
         # The hold kept time stopped; the advance ran it once, then paused again.
         self.assertEqual(client.calls.count("resume"), 1)
         self.assertEqual(client.calls[-1], "pause")
         self.assertGreater(client.tick, 1000)
 
         second = model.prompts[1]
-        self.assertIn("unchanged:", second)
-        self.assertIn("FAILED {'action': 'set_research', 'project': 'Brewing'}", second)
-        self.assertIn("skipped: an earlier order failed", second)
+        self.assertIn("3 orders: 1 OK, 1 UNCHANGED, 1 FAILED.", second)
+        self.assertIn('#1 UNCHANGED: {"action":"enable_work","colonist":"Ada","work_type":"Construction"}', second)
+        self.assertIn("#2 FAILED: {'action': 'set_research', 'project': 'Brewing'}", second)
+        self.assertIn("#3 OK:", second)
+        self.assertNotIn("skipped: an earlier order failed", second)
         self.assertIn("Unresolved:", second)
         self.assertIn("Consecutive held turns: 1.", second)
         # The model was handed this turn's schema, not the static one.

@@ -11,6 +11,7 @@ from rimagent.rimapi import RimApiError
 class Operations:
     lines: list[str] = field(default_factory=list)
     targets: dict[str, list[dict]] = field(default_factory=dict)
+    storage: dict | None = None  # /resources/storages/summary, for hints.storage_hint
 
 
 def read_operations(client, colonists, defs, map_id=0):
@@ -39,9 +40,7 @@ def read_operations(client, colonists, defs, map_id=0):
                             f"{farm.get('total_infected_plants', 0)} infected.")
         for crop in farm.get("crop_types", []):
             name = crop["plant_def_name"]
-            result.lines.append(f"Crop {name}: {crop.get('total_plants', 0)} plants, "
-                                f"{crop.get('harvestable_plants', 0)} harvestable; "
-                                f"growth {crop.get('growth_progress_average', 0):.0%}.")
+            result.lines.append(describe_crop(crop, defs.plants.get(name, {})))
             if crop.get("harvestable_plants", 0):
                 # Plant rows carry no growth, so these are the crop's cells;
                 # the harvest designation itself only takes ripe plants.
@@ -49,6 +48,7 @@ def read_operations(client, colonists, defs, map_id=0):
                     {"name": name, "x": p["position"]["x"], "z": p["position"]["z"]}
                     for p in client.get_plants(map_id) if p.get("def_name") == name)
     storage = get("resources/storages/summary")
+    result.storage = storage
     if storage:
         result.lines.append(f"Storage: {storage.get('used_cells', 0)}/{storage.get('total_cells', 0)} cells used.")
     power = get("map/power/info")
@@ -123,6 +123,26 @@ def read_operations(client, colonists, defs, map_id=0):
             result.lines.append(f"Nearest {kind} targets: " + "; ".join(describe_target(kind, t)
                                                                       for t in shown) + ".")
     return result
+
+
+def describe_crop(crop: dict, plant_def: dict) -> str:
+    """One crop's growth and readiness, from /map/farm/summary.
+
+    RIMAPI 1.10 fills growth_progress_average with the SUM of every plant's
+    growth (0-1 each) and never divides, so it is divided here. Its
+    days_until_harvest truncates to a whole number and is always 0, so it is
+    not used; the def's grow_days gives the time to full growth instead.
+    """
+    name, total = crop["plant_def_name"], crop.get("total_plants", 0)
+    ready = crop.get("harvestable_plants", 0)
+    growth = min(1.0, crop.get("growth_progress_average", 0) / total) if total else 0.0
+    text = f"Crop {name}: {total} plants, average growth {growth:.0%}"
+    grow_days = plant_def.get("grow_days")
+    if isinstance(grow_days, (int, float)) and grow_days > 0 and growth < 1:
+        text += f" (full growth takes {grow_days:g} days in good conditions)"
+    if ready:
+        return text + f"; {ready} ripe, harvested by colonists with Growing work."
+    return text + "; none ripe yet, so there is nothing to harvest: let time pass."
 
 
 def describe_target(kind: str, target: dict) -> str:

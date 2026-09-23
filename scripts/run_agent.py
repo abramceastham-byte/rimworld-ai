@@ -16,7 +16,7 @@ import argparse
 
 import httpx
 
-from rimagent.agent import TICKS_PER_SECOND, Turn, run
+from rimagent.agent import RUN_TICKS, THREAT_RUN_TICKS, TICKS_PER_SECOND, Turn, run
 from rimagent.events import EventListener
 from rimagent.fake_model import make_fake_model
 from rimagent.ollama_model import OllamaModel, parse_think
@@ -29,11 +29,11 @@ def main() -> None:
     parser.add_argument("--model", help="Ollama model name, e.g. qwen3:14b. Omit to use the fake model.")
     parser.add_argument("--think", help="on/off (qwen3) or low/medium/high (gpt-oss). Default: the model's own.")
     parser.add_argument("--steps", type=int, help="Decisions to make (default: 3 fake, 10 real).")
-    parser.add_argument("--run-seconds", type=float, default=10.0,
-                        help="Game time per decision, in seconds at normal speed (default 10). "
+    parser.add_argument("--run-seconds", type=float, default=RUN_TICKS / TICKS_PER_SECOND,
+                        help="Game time per advance, in seconds at normal speed (default 48: 8 real s at speed 3). "
                              "Higher --speed makes the real wait shorter, not the colony time.")
-    parser.add_argument("--threat-run-seconds", type=float, default=3.0,
-                        help="Game time per decision while a threat is active (default 3).")
+    parser.add_argument("--threat-run-seconds", type=float, default=THREAT_RUN_TICKS / TICKS_PER_SECOND,
+                        help="Game time per advance while a threat is active (default 14.4).")
     parser.add_argument("--speed", type=int, choices=(1, 2, 3), default=1,
                         help="Game speed while running: 1 normal, 2 fast, 3 superfast.")
     parser.add_argument("--num-ctx", type=int, default=16384, help="Model context window in tokens.")

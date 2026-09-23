@@ -4,7 +4,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from rimagent.actions import Turn
-from rimagent.construction import CROPS, FLOORS, available_buildings
+from rimagent.construction import CROPS, FLOORS, available_buildings, stuff_rank
+from rimagent.supplies import ALL_STUFF, how_to_get, usable_stuff
 
 # The skill each work type trains (RimWorld's WorkTypeDef.relevantSkills). A
 # totally disabled skill means the colonist can't do that work at all.
@@ -27,7 +28,10 @@ def incapable_work(colonist, learned: dict[str, set[str]] | None = None) -> set[
 @dataclass
 class Choices:
     fields: dict[str, dict[str, list]] = field(default_factory=dict)
-    work: dict[str, set[str]] = field(default_factory=dict)
+    work: dict[str, set[str]] = field(default_factory=dict)        # work each colonist can do
+    can_enable: dict[str, set[str]] = field(default_factory=dict)  # ...and doesn't have on yet
+    can_disable: dict[str, set[str]] = field(default_factory=dict)  # work they have on
+    researching: str | None = None
     recipes: dict[int, set[str]] = field(default_factory=dict)
     materials: dict[str, list[str | None]] = field(default_factory=dict)
     unavailable: list[str] = field(default_factory=list)
@@ -39,28 +43,48 @@ class Choices:
                 items, trees, target_kinds=(), learned_incapable=None):
         c = cls(width=terrain.width, height=terrain.height)
         c.work = {p.name: set(work_types) - incapable_work(p, learned_incapable) for p in colonists}
-        if c.work:
-            for action in ("enable_work", "disable_work"):
-                c.fields[action] = {"colonist": list(c.work), "work_type": list(work_types)}
+        # Standing orders already in effect aren't offered again: a run asked
+        # for the same colonists' Construction five times and the current
+        # research project four times.
+        enabled = {p.name: {w.work_type for w in p.work_priorities if w.priority > 0} for p in colonists}
+        c.can_enable = {name: work - enabled[name] for name, work in c.work.items()}
+        c.can_disable = {name: enabled[name] & set(work_types) for name in c.work}
+        for action, options in (("enable_work", c.can_enable), ("disable_work", c.can_disable)):
+            if any(options.values()):
+                c.fields[action] = {"colonist": [n for n, o in options.items() if o],
+                                    "work_type": sorted(set().union(*options.values()))}
         c.recipes = {t.id: {r.def_name for r in t.recipes} for t in tables if t.recipes}
         if c.recipes:
             c.fields["set_bill"] = {"building_id": list(c.recipes),
                                     "recipe_def_name": sorted(set.union(*c.recipes.values()))}
         else:
             c.unavailable.append("set_bill: no built table with available recipes")
-        projects = [p.name for p in research.available]
+        c.researching = research.current.name if research.current else None
+        projects = [p.name for p in research.available if p.name != c.researching]
         if projects:
             c.fields["set_research"] = {"project": projects}
+        elif c.researching:
+            c.unavailable.append(f"set_research: already researching {c.researching}, nothing else to switch to")
         else:
             c.unavailable.append("set_research: no currently available project/appropriate bench")
         finished = {p.name for p in research.all_projects if p.is_finished}
-        c.materials = {name: ([m for m in spec.materials() if m in defs.thing_names]
+        # Only materials the colony can use now: offering every stone block
+        # let models plan whole rooms in blocks nobody had.
+        usable = usable_stuff(items)
+        c.materials = {name: ([m for m in spec.materials() if m in defs.thing_names and m in usable]
                              if spec.materials() else [None])
                        for name, spec in available_buildings(finished).items()
                        if name in defs.thing_names}
         c.materials = {k: v for k, v in c.materials.items() if v}
+        missing = [m for m in ALL_STUFF if m in defs.thing_names and m not in usable]
+        if missing:
+            stone = [m for m in missing if m.startswith("Blocks")]
+            other = [m for m in missing if m not in stone]
+            c.unavailable += [f"stuff {m}: none usable ({how_to_get(m)})" for m in other]
+            if stone:
+                c.unavailable.append("stuff stone blocks: none (build in wood)")
         if c.materials:
-            mats = sorted({m for ms in c.materials.values() for m in ms if m is not None})
+            mats = sorted({m for ms in c.materials.values() for m in ms if m is not None}, key=stuff_rank)
             c.fields["place_blueprint"] = {"building_def": list(c.materials), "stuff": mats + [None]}
         if "Wall" in c.materials:
             c.fields["build_wall"] = {"stuff": c.materials["Wall"]}
@@ -68,11 +92,11 @@ class Choices:
                 c.fields["build_room"] = {"stuff": [m for m in c.materials["Wall"]
                                                        if m in c.materials["Door"]]}
         floors = [n for n, f in FLOORS.items() if n in defs.terrain
-                  and (not f.research or f.research in finished)]
+                  and (not f.research or f.research in finished) and usable.get(f.cost[0])]
         if floors:
             c.fields["build_floor"] = {"terrain": floors}
         else:
-            c.unavailable.append("build_floor: no unlocked floor definitions")
+            c.unavailable.append("build_floor: no unlocked floor with usable material")
         crops = [n for n in CROPS if n in defs.crop_fertility_min]
         if crops:
             c.fields["create_growing_zone"] = {"plant": crops}
@@ -111,8 +135,8 @@ class Choices:
             pairing = {
                 "place_blueprint": ("building_def", "stuff", self.materials),
                 "set_bill": ("building_id", "recipe_def_name", self.recipes),
-                "enable_work": ("colonist", "work_type", self.work),
-                "disable_work": ("colonist", "work_type", self.work),
+                "enable_work": ("colonist", "work_type", self.can_enable),
+                "disable_work": ("colonist", "work_type", self.can_disable),
             }.get(action)
             if pairing:
                 selector, dependent, mapping = pairing
@@ -120,7 +144,8 @@ class Choices:
                 groups = {}
                 for key, values in mapping.items():
                     if values:
-                        groups.setdefault(tuple(sorted(values, key=str)), []).append(key)
+                        order = stuff_rank if dependent == "stuff" else str
+                        groups.setdefault(tuple(sorted(values, key=order)), []).append(key)
                 for values, keys in groups.items():
                     variant = deepcopy(branch)
                     p = variant["properties"]
@@ -147,6 +172,10 @@ class Choices:
 
     def validate(self, turn: Turn):
         for a in turn.actions:
+            if self.already_in_effect(a):
+                # Not offered by the schema; without one, let it through to be
+                # reported "unchanged" rather than throw away the whole reply.
+                continue
             if a.action not in self.fields:
                 raise ValueError(f"{a.action} is unavailable: {'; '.join(self.unavailable)}")
             for name, values in self.fields[a.action].items():
@@ -164,6 +193,17 @@ class Choices:
                 value = getattr(a, name, None)
                 if value is not None and value >= (self.width if name[0] == "x" else self.height):
                     raise ValueError(f"{name}={value} is outside the map")
+
+
+    def already_in_effect(self, a) -> str | None:
+        """Why an order changes nothing, when it repeats one already in effect."""
+        if a.action == "set_research" and a.project == self.researching:
+            return f"{a.project} is already being researched"
+        if a.action == "enable_work" and a.colonist in self.work and a.work_type in self.work[a.colonist]                 and a.work_type not in self.can_enable.get(a.colonist, set()):
+            return f"{a.colonist} already has {a.work_type} on"
+        if a.action == "disable_work" and a.colonist in self.work                 and a.work_type not in self.can_disable.get(a.colonist, set()):
+            return f"{a.colonist} already has {a.work_type} off"
+        return None
 
 
 def action_target(action):

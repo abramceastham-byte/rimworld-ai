@@ -1,6 +1,7 @@
 """The agent loop: observe the game, ask a model what to do, act, and log it."""
 
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -11,6 +12,10 @@ from pydantic import ValidationError
 from rimagent.actions import Turn
 from rimagent.blueprints import BlueprintTracker, Status, TrackedBlueprint
 from rimagent.choices import Choices, FailureMemory, incapable_work
+from rimagent.chopping import ChopTracker
+from rimagent.hints import (IdleTracker, TurnFacts, failure_hint, idle_hint, pending_work, storage_hint,
+                            success_hint)
+from rimagent.rooms import RoomTracker
 from rimagent.construction import (
     BUILDINGS,
     CROPS,
@@ -41,7 +46,7 @@ from rimagent.mapview import (
     overview_rows,
 )
 from rimagent.events import EventListener, GameEvent
-from rimagent.memory import AgentMemory, MemoryUpdate
+from rimagent.memory import AgentMemory
 from rimagent.rimapi import (
     NORMAL,
     Alert,
@@ -57,49 +62,73 @@ from rimagent.rimapi import (
     WorkTable,
 )
 from rimagent.runlog import RunLogger
+from rimagent.supplies import describe_supplies, how_to_get, short_materials, stock_by_def, usable_stuff
 from rimagent.zones import TrackedZone, ZoneTracker
 
 
 GAME_FACTS = """Rules:
 - Orders queue work; construction, chopping, growing and production need advancing time.
-- Allowed supplies are not necessarily reachable. Chunks require stonecutting; use logs/steel/blocks to build.
+- Allowed supplies are not necessarily reachable.
+- Materials: build walls and furniture in WoodLog; trees regrow (chop_trees for more). Stone blocks are
+  a fireproof upgrade for later, not a first step. Save Steel: it doesn't regrow, and components,
+  machines, power and weapons need it. Use Steel for building only when nothing else will do.
 - Growing needs fertile ground, suitable temperature and Growing work; no seeds are needed.
+  Colonists with Growing work sow and harvest their growing zones by themselves when crops are ripe.
 - Construction needs an enabled capable worker and all listed materials. Fuelled devices also need fuel;
   electrical devices need a connected power supply. A bill needs ingredients and a capable worker.
-- A blueprint is an order, not a finished building. A room is a closed ring of walls with a door;
-  colonists roof it automatically once it is closed.
+- A blueprint is an order, not a finished building. Blueprints can't be moved or cancelled from here:
+  placing one again makes a second copy. A room is a closed ring of walls with a door; colonists
+  roof it automatically once it is closed, so never wall in a growing zone.
 """
 
-INSTRUCTIONS = """Manage this colony; choose your own priorities and strategy.
-Reply as JSON: {"actions":[0 to 5 orders], "time":"advance" or "hold", "memory_update":optional}.
+INSTRUCTIONS = """You are the colony's manager, not a colonist. Your orders are standing orders: the research
+project, enabled work, placed blueprints, bills, zones and cut orders all stay in effect, and colonists
+carry them out by themselves whenever time advances and they are able to.
+Never repeat an order that is already in effect; it changes nothing. If one isn't progressing, fix the
+cause (missing material, nobody with that work on, no bench or table) or simply advance time.
+Most turns need a few new orders, or none, then advance. Choose your own priorities and strategy.
+Reply as JSON: {"actions":[0 to 10 orders], "time":"advance" or "hold", "memory_update":optional}.
 All orders execute while paused. Choose advance to let queued work progress after this turn;
 hold keeps this turn paused. Choose afresh every turn. Empty actions + advance means wait.
-Orders execute in order against refreshed state. If one fails, remaining orders are skipped;
-repair the problem next turn. API acceptance is not proof of completed work.
+Orders execute in order against refreshed state, and every one is tried even if an earlier one
+failed, so an order that relied on a failed one may fail too. Next turn each is reported by number
+as OK, UNCHANGED or FAILED. API acceptance is not proof of completed work. A result may end
+with HINT: a suggested next step drawn from this turn's state; follow it unless you have a reason not to.
 Use exact names/IDs below. Never include display labels in def names. Each order has action FIRST,
-a short reason, and only its fields. Already-satisfied settings are unchanged, not failures.
+a short reason, and only its fields.
 Fields (inclusive rectangles use x1,z1,x2,z2; x east, z north):
 - enable_work / disable_work: colonist, work_type.
 - set_bill: building_id, recipe_def_name, target_count (1..500); creates/updates Do until X.
 - set_research: project (available name); no bills on research benches.
-- create_growing_zone: plant, rectangle (<=225 cells).
+- create_growing_zone: plant, rectangle (<=225 cells), in the open: never inside a room or where you
+  mean to build one, since a closed room is roofed and crops need sunlight.
 - create_stockpile: rectangle (<=225); normal priority, accepts normal items.
 - place_blueprint: building_def, x,z, rotation (0=N,1=E,2=S,3=W), stuff.
   x,z is RimWorld's anchor, not always a corner; use checked candidates. Fixed-cost buildings: stuff=null.
-- build_room: outer rectangle (4..15 cells per side), stuff, door_side (north/east/south/west).
-  One centred door in that side. Only the perimeter must be clear; walls or rock already on it are kept,
+- build_room: OUTER rectangle including the walls (4..15 cells per side; inside is 2 smaller each way,
+  so a 3x3 inside needs 5x5 outer), stuff, door_side (north/east/south/west), purpose (bedroom,
+  barracks, kitchen, dining, workshop, storage, hospital, other: later prompts say what it still needs).
+  One centred door in that side. Only the perimeter must be clear; walls, doors or rock already on it are kept,
   anything else refuses the whole room. The inside is untouched; no floor included.
-- build_wall: straight rectangle (<=20 cells), stuff; blocked cells are skipped and reported.
+- build_wall: straight rectangle (<=20 cells), stuff; blocked cells are skipped and reported. It only
+  adds walls: nothing here removes a wall or building.
 - build_floor: rectangle (<=225), terrain (listed floor name); existing/pending floors are skipped.
-- designate: designation (mine/harvest/hunt), rectangle (<=400). Only use observed targets;
+- designate: never for trees (use chop_trees). mine = rock only, hunt = one animal, harvest = ripe wild plants.
+  Rectangle: mine <=400 cells, harvest any size. Only use observed targets;
   hunt requires exactly ONE cell: x1=x2 and z1=z2, at an observed animal.
-  harvest readiness is unknown unless stated; hunting risks retaliation and needs an armed hunter.
-- allow_items: rectangle (<=400); makes forbidden items usable.
-- chop_trees: rectangle (<=400), up to 30 trees; submits harvest requests, young/already-marked trees may be ignored.
+  harvest marks ripe plants only (wild ones; fields are harvested anyway); hunting risks retaliation and needs an armed hunter.
+- allow_items: any rectangle on the map; makes the forbidden items in it usable.
+- chop_trees: THE way to get wood from trees. Any rectangle; orders up to 30 trees nearest its centre cut.
+  Trees already ordered are skipped; the game ignores trees too young for wood.
 Actions without usable targets are excluded from this turn's schema; unavailable capabilities are listed.
-Keep memory brief: objective/steps/policies are intentions, observation is durable knowledge.
-Do not copy live facts into memory. Mark completed only after observation confirms it.
-Plan/policy changes are discarded on failed or partially verified orders.
+memory_update keeps what matters for the whole game, not a diary of this turn:
+- observation: a big discovery or idea worth remembering for the rest of the colony's life, e.g.
+  "colonists are happier with a bedroom each than sharing", "colonists are comfortable between
+  16 and 26 C", "raids have come from the east edge". Not what you ordered or what happened this
+  turn, and no numbers the prompt shows every turn (stock, jobs, ticks): those go stale.
+- replace_plan / policies: your objective, its steps and your standing rules.
+A step you mark completed is held as in_progress until a later turn: mark it completed again once
+the game shows it done.
 """
 
 
@@ -126,6 +155,12 @@ def describe_colonist(c: Colonist, work_types: list[str],
 TICKS_PER_HOUR = 2500      # RimWorld: 60,000 ticks per in-game day
 TICKS_PER_SECOND = 60      # at speed 1; speed 2 is 3x that, speed 3 is 6x
 PAUSED_NUDGE_AFTER = 4     # consecutive held turns
+# Game time per advance: 2,880 ticks (1.15 in-game hours), which is 8 real
+# seconds at speed 3, 16 at speed 2, 48 at speed 1. While a threat is active,
+# 30% of that (864 ticks). Shorter windows spent most of a run asking the
+# model about a colony that had barely moved.
+RUN_TICKS = 48 * TICKS_PER_SECOND
+THREAT_RUN_TICKS = round(RUN_TICKS * 0.3)
 
 
 @dataclass
@@ -263,24 +298,6 @@ def describe_time(mode: TimeMode, window: TimeWindow | None,
     return text
 
 
-def honest_memory_update(update: MemoryUpdate | None, any_failed: bool) -> MemoryUpdate | None:
-    """Drop plan and policy changes when an action in the same turn failed.
-
-    A failed action changes nothing in the game, but models still report the
-    step "completed" in the same reply. Observations are kept: they may well
-    be about the failure.
-    """
-    if update is None or not any_failed:
-        return update
-    claims_progress = bool(
-        update.replace_plan or update.clear_plan or update.status_updates
-        or update.clear_statuses or update.policies_to_add or update.policies_to_remove
-    )
-    if not claims_progress:
-        return update
-    return MemoryUpdate(observation=update.observation) if update.observation else None
-
-
 def describe_work_table(table: WorkTable) -> list[str]:
     """Describe one table without making the model invent ids or recipe names."""
     position = f"({table.position.x}, {table.position.z})"
@@ -333,46 +350,64 @@ def colony_center(colonists: list[Colonist]) -> tuple[int, int] | None:
     return (round(sum(p.x for p in spots) / len(spots)), round(sum(p.z for p in spots) / len(spots)))
 
 
-def stock_by_def(items: list[MapThing], forbidden: bool) -> dict[str, int]:
-    """How much of each item def is lying around, allowed or forbidden."""
-    totals: dict[str, int] = {}
-    for i in items:
-        if i.is_forbidden == forbidden:
-            totals[i.def_name] = totals.get(i.def_name, 0) + i.stack_count
-    return totals
+def describe_research(state: ResearchState, researchers: list[str] | None = None) -> list[str]:
+    """What the colony is researching, who works on it, and what it could switch to.
 
-
-def describe_supplies(items: list[MapThing], limit: int = 12) -> list[str]:
-    """What the colony can build with now, and what is locked behind allow_items."""
-    def listed(totals: dict[str, int]) -> str:
-        top = sorted(totals.items(), key=lambda kv: -kv[1])[:limit]
-        more = f", and {len(totals) - limit} more kinds" if len(totals) > limit else ""
-        return ", ".join(f"{name} {n}" for name, n in top) + more if top else "nothing"
-
-    usable, locked = stock_by_def(items, False), stock_by_def(items, True)
-    return [
-        f"Map-wide allowed supplies you can use now: {listed(usable)}.",
-        f"Map-wide forbidden, unusable until you allow_items: {listed(locked)}.",
-    ]
-
-
-def describe_research(state: ResearchState) -> list[str]:
-    """What the colony is researching, and what it could start instead."""
+    Says outright that the current project carries on by itself: models kept
+    selecting the project already being researched, turn after turn.
+    """
+    current = state.current.name if state.current else None
     if state.current:
-        now = f"Researching {state.current.label} ({state.current.progress_percent:.0f}% done)."
+        done = state.current.progress_percent
+        points = state.current.model_extra.get("progress") if state.current.model_extra else None
+        of = (f", {points:g} of {state.current.research_points:g} points"
+              if isinstance(points, (int, float)) and state.current.research_points else "")
+        now = (f"Researching {state.current.label} ({done:.0%} done{of}). This is a "
+               "standing order: it carries on by itself while time advances")
+        if researchers is None:
+            now += "."
+        elif researchers:
+            now += f", worked on by colonists with Research on: {', '.join(researchers)}."
+        else:
+            now += ", but nobody has Research on, so it is stalled: enable_work Research."
     else:
-        now = "Researching nothing."
+        now = "Researching nothing: choose a project with set_research."
     if not state.has_bench:
         return [now + " No research bench is built, so no research happens yet."]
     choices = ", ".join(f"{p.name} ({p.label}, {p.research_points:.0f} points)"
-                        for p in state.available) or "none"
-    return [now, f"Could start now: {choices}."]
+                        for p in state.available if p.name != current) or "none"
+    return [now, f"{'Could switch to' if current else 'Could start now'}: {choices}."]
 
 
-def blocked_by(check: object) -> bool:
-    """True when RIMAPI's area check found anything in the way."""
-    return bool(getattr(check, "terrain", []) or getattr(check, "ores", [])
-                or getattr(check, "buildings", []) or getattr(check, "zones", []))
+def issue_cells(check: object) -> set[tuple[int, int]]:
+    """The cells RIMAPI's area check reported something on."""
+    return {(i.x, i.z) for kind in ("terrain", "ores", "buildings", "zones")
+            for i in getattr(check, kind, [])}
+
+
+def reach_of_issues(check: object, zone_sizes: dict[str, int]) -> set[tuple[int, int]]:
+    """Cells to rule out around what RIMAPI's area check reported.
+
+    It names one cell per zone and a building at its anchor only, so ruling
+    out just those cells made the next candidate the same rectangle a cell
+    over, and every check went on the same field. Instead, rule out the area
+    the thing could cover: for a zone of N cells (from /map/zones, by name) a
+    square reaching sqrt(N) cells around the reported cell; for a building, 2
+    cells (the biggest the catalog has is 3 wide). Rock and bad terrain are
+    reported cell by cell, so those are exact. Offered spots are still checked
+    clear, so this only ever skips a little free ground, never offers taken.
+    """
+    cells = {(i.x, i.z) for i in getattr(check, "terrain", []) + getattr(check, "ores", [])}
+
+    def around(x: int, z: int, reach: int) -> set[tuple[int, int]]:
+        return {(x + dx, z + dz) for dx in range(-reach, reach + 1) for dz in range(-reach, reach + 1)}
+
+    for zone in getattr(check, "zones", []):
+        size = zone_sizes.get(zone.label or "", 225)
+        cells |= around(zone.x, zone.z, max(1, math.ceil(math.sqrt(size)) - 1))
+    for building in getattr(check, "buildings", []):
+        cells |= around(building.x, building.z, 2)
+    return cells
 
 
 def describe_map(
@@ -386,6 +421,10 @@ def describe_map(
     blueprints: list[tuple[TrackedBlueprint, Status]] | None = None,
     buildings: list[Building] | None = None,
     check_area: Callable[[Rect], object] | None = None,
+    stored: list[MapThing] | None = None,
+    tables: list[WorkTable] = (),
+    found: dict | None = None,
+    zone_sizes: dict[str, int] | None = None,
 ) -> list[str]:
     """Everything the model needs to pick a place without reading the grid.
 
@@ -443,16 +482,18 @@ def describe_map(
     lines += ["", *detail_rows(view, terrain, defs.terrain, marks)]
 
     spots = free_spots(anchor, terrain, defs.terrain, built_cells | zone_cells,
-                       is_clear=(lambda rect: not blocked_by(check_area(rect))) if check_area else None)
+                       blocked_in=(lambda rect: reach_of_issues(check_area(rect), zone_sizes or {}))
+                       if check_area else None)
+    if found is not None:  # for hints (see hints.TurnFacts)
+        found.update(spots=spots, anchor=anchor)
     if spots:
-        lines += ["", "Free spots near the base, checked just now (use these coordinates):"]
+        lines += ["", "Open ground near the base, checked clear just now. Each is the biggest clear "
+                      "rectangle found there: use all of it or any part; the sizes are only suggestions:"]
         lines += [f"  {letter}: {rect} - {note}" for letter, rect, note in spots]
 
-    lines += ["", *describe_supplies(items or [], limit=24)]
-    nearby = stock_by_def([i for i in items or [] if view.contains(i.position.x, i.position.z)], False)
-    lines.append("Of those, inside the detail view: "
-                 + (", ".join(f"{k} {v}" for k, v in sorted(nearby.items(), key=lambda kv: -kv[1]))
-                    or "nothing") + ".")
+    unfinished = [dict(def_name=bp.def_name, stuff=bp.stuff, floor=bp.floor)
+                  for bp, status in blueprints or [] if status in ("waiting", "under construction")]
+    lines += ["", *describe_supplies(items or [], stored, tables, finished_research, unfinished)]
     # Where to point allow_items: the nearest forbidden items, not a box around
     # every one on the map (which covers everything and helps nobody).
     def steps_away(i: MapThing) -> int:
@@ -494,20 +535,11 @@ def describe_map(
             f"{b.label} at ({b.position.x},{b.position.z})" for b in started) + ".")
 
     if blueprints:
-        usable = stock_by_def([i for i in items or []], False)
-        lines.append("Your blueprints, checked in the game just now:")
-        for bp, status in blueprints:
-            if status == "waiting":
-                note = "waiting to be built"
-                if bp.stuff and not usable.get(bp.stuff):
-                    note += (f" - no usable {bp.stuff} on the map, so nobody can build it "
-                             "(allow_items, or chop trees for wood)")
-                else:
-                    note += " (needs a colonist with Construction enabled)"
-            else:
-                note = {"under construction": "under construction", "built": "built",
-                        "gone": "gone (cancelled or destroyed)"}[status]
-            lines.append(f"- {bp.label()}, covering {bp.area()}: {note}")
+        lines.append("Your blueprints, checked in the game just now (touching ones grouped):")
+        builders = [c.name for c in colonists
+                    if any(w.work_type == "Construction" and w.priority > 0 for w in c.work_priorities)]
+        lines += describe_blueprints(blueprints, usable_stuff(items or []), builders,
+                                     short_materials(items or [], stored, unfinished))
     else:
         lines.append("Your blueprints: none.")
 
@@ -522,7 +554,7 @@ def describe_map(
     lines.append(
         "Stuff materials: "
         + "; ".join(f"{cat} = {', '.join(names)}" for cat, names in STUFF_BY_CATEGORY.items())
-        + "."
+        + " (stone blocks, cut from chunks; chunks themselves are not stuff)."
     )
     crops = ", ".join(
         f"{name} ({label}, fertility {defs.crop_fertility_min.get(name, 0):.1f}+)"
@@ -542,7 +574,7 @@ def describe_map(
         # place_blueprint's x,z is RimWorld's anchor, which is not the corner
         # for wider buildings. One worked example per footprint size, computed
         # with the same rule placement is checked against, inside a free spot.
-        letter, rect, _ = spots[-1]  # the largest spot fits every size
+        letter, rect, _ = max(spots, key=lambda s: s[1].cells)  # the largest fits every size
         examples = []
         for size in sorted({spec.size for spec in buildable.values()} - {(1, 1)}):
             anchor_cell = next(((x, z) for x, z in rect
@@ -553,6 +585,67 @@ def describe_map(
         if examples:
             lines.append(f"Anchors facing north, e.g. in spot {letter}: " + "; ".join(examples)
                          + ". A 1x1 building covers just its x,z.")
+    return lines
+
+
+def blueprint_groups(blueprints: list[tuple[TrackedBlueprint, Status]]) -> list[list]:
+    """Blueprints whose cells touch (sides or corners) form one group, so a
+    room's walls and door read as one thing, not a line per wall."""
+    cells = [set(bp.area()) for bp, _ in blueprints]
+    groups: list[list[int]] = []
+    seen: set[int] = set()
+    for start in range(len(blueprints)):
+        if start in seen:
+            continue
+        group, todo = [], [start]
+        seen.add(start)
+        while todo:
+            i = todo.pop()
+            group.append(i)
+            near = {(x + dx, z + dz) for x, z in cells[i] for dx in (-1, 0, 1) for dz in (-1, 0, 1)}
+            for j in range(len(blueprints)):
+                if j not in seen and cells[j] & near:
+                    seen.add(j)
+                    todo.append(j)
+        groups.append([blueprints[i] for i in sorted(group)])
+    return groups
+
+
+def describe_blueprints(blueprints: list[tuple[TrackedBlueprint, Status]],
+                        usable: dict[str, int], builders: list[str] | None = None,
+                        short: set[str] = frozenset()) -> list[str]:
+    """One line per group, e.g. "- 15 Wall + 1 Door (BlocksSandstone) within
+    (117,132)-(121,136): 16 waiting - nobody can build them: no usable ..."."""
+    lines = []
+    for group in blueprint_groups(blueprints):
+        kinds: dict[tuple[str, str | None], int] = {}
+        statuses: dict[str, int] = {}
+        for bp, status in group:
+            kinds[(bp.def_name, bp.stuff)] = kinds.get((bp.def_name, bp.stuff), 0) + 1
+            statuses[status] = statuses.get(status, 0) + 1
+        stuffs = sorted({stuff for _, stuff in kinds if stuff})
+        what = " + ".join(f"{n} {name}" if n > 1 or len(group) > 1 else name
+                          for (name, _), n in kinds.items())
+        if stuffs:
+            what += f" ({', '.join(stuffs)})"
+        area = Rect.from_corners(min(bp.area().x1 for bp, _ in group), min(bp.area().z1 for bp, _ in group),
+                                 max(bp.area().x2 for bp, _ in group), max(bp.area().z2 for bp, _ in group))
+        where = f"covering {area}" if len(group) == 1 else f"within {area}"
+        state = ", ".join(f"{n} {s}" for s, n in statuses.items()) if len(group) > 1 else group[0][1]
+        state = state.replace("gone", "gone (cancelled or destroyed)")
+        notes = []
+        if statuses.get("waiting"):
+            missing = sorted({bp.stuff for bp, s in group if s == "waiting" and bp.stuff
+                              and not usable.get(bp.stuff)})
+            notes += [f"nobody can build with {m}, none is usable: {how_to_get(m)}" for m in missing]
+            scarce = sorted({bp.stuff for bp, s in group if s == "waiting" and bp.stuff in short} - set(missing))
+            notes += [f"not enough {m} for all your unfinished builds: {how_to_get(m)}" for m in scarce]
+            if not missing and not scarce and builders:
+                notes.append(f"materials are there and Construction is on for {', '.join(builders)}: "
+                             "they build it while time advances, between more urgent jobs")
+            elif not missing and not scarce:
+                notes.append("nobody has Construction on: enable_work Construction")
+        lines.append(f"- {what} {where}: {state}" + (" - " + "; ".join(notes) if notes else ""))
     return lines
 
 
@@ -575,7 +668,7 @@ def build_prompt(
     lines = [
         "Current game state:",
         time_status,
-        *(["", "What your last orders actually did, and failures still unresolved:",
+        *(["", "What your last orders actually did, failures still unresolved, and hints:",
            *[f"- {r}" for r in last_results]] if last_results else []),
         "",
         f"Tick {state.game_tick}. {state.colonist_count} colonists.",
@@ -592,7 +685,9 @@ def build_prompt(
         "Colonists:",
         *[describe_colonist(c, work_types, learned_incapable) for c in colonists],
         "",
-        "Research: " + " ".join(describe_research(research)),
+        "Research: " + " ".join(describe_research(research, [
+            c.name for c in colonists
+            if any(w.work_type == "Research" and w.priority > 0 for w in c.work_priorities)])),
         "",
         "Work tables and production bills:",
         *(
@@ -683,9 +778,33 @@ def action_area(target: dict) -> Rect | None:
     return Rect(rect.x1 - 3, rect.z1 - 3, rect.x2 + 3, rect.z2 + 3)
 
 
+def room_state(buildings, report) -> tuple[dict, list]:
+    """For RoomTracker.describe: which cells hold walls or doors, and every
+    building or blueprint with its area and state."""
+    walls: dict[tuple[int, int], str] = {}
+    contents = []
+    for b in buildings:
+        state = "being built" if b.under_construction else "built"
+        name = b.def_name.removeprefix("Frame_")
+        if name in ("Wall", "Door"):
+            for cell in b.area():
+                walls[cell] = "built" if state == "built" else "planned"
+        else:
+            contents.append((name, b.area(), state))
+    for bp, status in report:
+        if status not in ("waiting", "under construction"):
+            continue
+        if bp.def_name in ("Wall", "Door"):
+            for cell in bp.area():
+                walls.setdefault(cell, "planned")
+        elif not bp.floor:
+            contents.append((bp.def_name, bp.area(), "planned" if status == "waiting" else "being built"))
+    return walls, contents
+
+
 def prepare_turn(client, memory, blueprints, zones, mode, window=None,
-                 run_ticks=600, threat_run_ticks=180, new_events=(), last_results=(), failures=None,
-                 read_only=False, learned_incapable=None):
+                 run_ticks=RUN_TICKS, threat_run_ticks=THREAT_RUN_TICKS, new_events=(), last_results=(), failures=None,
+                 read_only=False, learned_incapable=None, chops=None, rooms=None, idle=None):
     """Observe the game and build this turn's prompt and choices.
 
     Shared by live play and dry runs; with read_only=True nothing is saved,
@@ -707,6 +826,13 @@ def prepare_turn(client, memory, blueprints, zones, mode, window=None,
         zones.save()
     report = blueprints.check(client, forget_finished=not read_only)
     operations = read_operations(client, colonists, defs)
+    if chops is not None:
+        chops.reconcile(trees)
+        cutters = [c.name for c in colonists
+                   if any(w.work_type == "PlantCutting" and w.priority > 0 for w in c.work_priorities)]
+        chop_line = chops.describe(state.game_tick, cutters)
+        if chop_line:
+            operations.lines.append(chop_line)
     unknown = [z for z in live_zones if z.id not in {k.zone_id for k in known_zones}]
     if unknown:
         operations.lines.append("Zones with unknown/edited geometry (placement checks still protect them): " +
@@ -714,9 +840,22 @@ def prepare_turn(client, memory, blueprints, zones, mode, window=None,
     choices = Choices.observe(colonists, work_types, tables, research, defs, terrain,
                               items, trees, [k for k, v in operations.targets.items() if v],
                               learned_incapable)
+    try:
+        stored = client.get_stored_items()
+    except (RimApiError, httpx.HTTPError) as error:  # the prompt still works without it
+        print(f"could not read stored resources: {error}")
+        stored = None
+    found: dict = {}
     map_lines = describe_map(colonists, terrain, defs, known_zones,
                              {p.name for p in research.all_projects if p.is_finished},
-                             items, trees, report, buildings, client.check_area)
+                             items, trees, report, buildings, client.check_area, stored, tables, found,
+                             {z.label: z.cells_count for z in live_zones})
+    facts = TurnFacts(spots=found.get("spots", []), targets=operations.targets, trees=trees, items=items,
+                      stored=stored, report=report, buildings=buildings, colonists=colonists,
+                      anchor=found.get("anchor"), learned=learned_incapable or {})
+    if rooms is not None and rooms.items:
+        map_lines += ["", "Your rooms (purpose as you tagged it):",
+                      *(rooms.describe(*room_state(buildings, report)) or ["none standing any more"])]
     time_status = describe_time(mode, window, run_ticks, threat_run_ticks)
 
     def local_zones(area):
@@ -768,23 +907,34 @@ def prepare_turn(client, memory, blueprints, zones, mode, window=None,
     if failures:
         failures.reconcile(fingerprint)
     feedback = list(last_results) + (failures.lines() if failures else [])
+    if idle is not None:
+        unfinished = [dict(def_name=bp.def_name, stuff=bp.stuff, floor=bp.floor) for bp in facts.unfinished()]
+        pending = pending_work(facts, research, tables, live_zones, len(chops.orders) if chops else 0,
+                               short_materials(items, stored, unfinished))
+        capable = {c.name: set(work_types) - incapable_work(c, learned_incapable) for c in colonists}
+        idle_line = idle_hint(idle.update(colonists), facts, pending, capable)
+        if idle_line:
+            feedback.append(idle_line)
+    full = storage_hint(operations.storage, "Shelf" in choices.materials)
+    if full:
+        feedback.append(full)
     unavailable = ["Unavailable now: " + "; ".join(choices.unavailable)] if choices.unavailable else []
     prompt = build_prompt(state, colonists, alerts, threats, list(new_events), work_types,
                           tables, research, time_status, memory,
                           map_lines + operations.lines + unavailable,
                           feedback, learned_incapable)
     return dict(prompt=prompt, choices=choices, operations=operations, state=state,
-                threats=threats, time_status=time_status, fingerprint=fingerprint)
+                threats=threats, time_status=time_status, fingerprint=fingerprint, facts=facts)
 
 
 def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
         events: EventListener | None = None, max_steps: int = 10,
-        run_ticks: int = 10 * TICKS_PER_SECOND, threat_run_ticks: int = 3 * TICKS_PER_SECOND,
+        run_ticks: int = RUN_TICKS, threat_run_ticks: int = THREAT_RUN_TICKS,
         speed: int = NORMAL, memory: AgentMemory | None = None) -> None:
     """Run the agent loop for max_steps turns.
 
     Each turn: pause, observe, ask the model, carry out its orders in order
-    (stopping at the first failure), then follow its time choice. advance lets
+    (every one, even after a failure), then follow its time choice. advance lets
     the game run run_ticks (threat_run_ticks while a threat is active),
     stopping early if a threat arrives or the game pauses itself; hold keeps it
     paused. Nothing about time carries over: every reply chooses again.
@@ -794,6 +944,9 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
     memory = memory or AgentMemory()
     blueprints = BlueprintTracker(memory.memory_dir / "blueprints.json")
     zones = ZoneTracker(memory.memory_dir / "zones.json")
+    chops = ChopTracker(memory.memory_dir / "chops.json")
+    rooms = RoomTracker(memory.memory_dir / "rooms.json")
+    idle = IdleTracker()
     failures = FailureMemory()
     learned_incapable: dict[str, set[str]] = {}  # colonist name -> work RIMAPI refused
     mode = TimeMode(True, "session start")
@@ -807,7 +960,8 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
             try:
                 context = prepare_turn(client, memory, blueprints, zones, mode, window,
                                        run_ticks, threat_run_ticks, new_events, last_results, failures,
-                                       learned_incapable=learned_incapable)
+                                       learned_incapable=learned_incapable, chops=chops, rooms=rooms,
+                                       idle=idle)
             except (RimApiError, httpx.HTTPError, ValueError) as error:
                 logger.log_model_failure({"step": step, "failure_type": "observation_error", "error": str(error)})
                 # Preserve threat events even when this observation fails.
@@ -823,23 +977,38 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
                 logger.log_event(event)
             danger = any(t.active for t in context['threats']) or any(e.category.startswith('Threat') for e in new_events)
             turn, reply = request_turn(model, prompt, logger, step, danger, choices)
-            results, any_failed = [], False
+            results = []
+            counts = {"OK": 0, "UNCHANGED": 0, "FAILED": 0}
             # Empty turns still retain prompt/reasoning/reply in logs.
             for index, action in enumerate(turn.actions or [None]):
                 error, result = None, "no orders"
                 if action is not None:
-                    if any_failed:
-                        result = "skipped: an earlier order failed; observations must be refreshed"
-                    else:
-                        try:
-                            result = execute(client, action, blueprints, zones, context['operations'],
-                                             learned_incapable)
-                        except (RimApiError, httpx.HTTPError, ValueError) as exc:
-                            error = str(exc)
-                            result = f"FAILED {action.model_dump(exclude={'reason'})}: {error}"
-                            any_failed = True
+                    # Every order is tried, even after a failure: the game refuses
+                    # one that relied on it, and the report says which worked.
+                    try:
+                        result = execute(client, action, blueprints, zones, context['operations'],
+                                         learned_incapable, chops)
+                        if action.action == "build_room" and not result.startswith("unchanged"):
+                            rooms.add(action.rect(), action.purpose, action.door_side)
+                        hint = success_hint(action, result, client.submitted_blueprints, context['facts'])
+                        if hint:
+                            result += f" HINT: {hint}"
+                    except (RimApiError, httpx.HTTPError, ValueError) as exc:
+                        error = str(exc)
+                        hint, keep = failure_hint(action, error, context['facts'])
+                        if hint:
+                            error += f" HINT: {hint}"
+                        result = f"FAILED {action.model_dump(exclude={'reason'})}: {error}"
+                        # Nothing to fix (e.g. its own blueprint was in the way): don't keep it
+                        # in the prompt as "unresolved", which read as a problem to solve.
+                        if keep:
                             failures.remember(action, error, context['fingerprint'](action.model_dump()))
-                    results.append(result)
+                    status = ("FAILED" if error else
+                              "UNCHANGED" if result.startswith("unchanged") or ": unchanged: " in result else "OK")
+                    counts[status] += 1
+                    results.append(f"#{index + 1} {status}: "
+                                   + (result.removeprefix("unchanged: ") if status == "UNCHANGED" else
+                                      result.removeprefix("FAILED ")))
                     memory.remember_decision(step, action.action, action.reason, error,
                                              getattr(action, 'colonist', None), getattr(action, 'work_type', None))
                 logger.log_decision({
@@ -853,9 +1022,11 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
                     "choice_schema": choices.schema() if index == 0 else None,
                 })
                 print(f"Step {step}.{index}: {result}")
-            last_results = results
-            memory.apply_update(step, context['state'].game_tick,
-                                honest_memory_update(turn.memory_update, any_failed))
+            last_results = ([f"{len(results)} orders: {counts['OK']} OK, {counts['UNCHANGED']} UNCHANGED, "
+                             f"{counts['FAILED']} FAILED."] + results) if results else []
+            # Plan and policies are always kept; a step reported completed is
+            # held until a later turn confirms it (see memory.held_until_confirmed).
+            memory.apply_update(step, context['state'].game_tick, turn.memory_update)
             mode = mode_after_decision(mode, turn.time)
             if turn.time == 'hold':
                 window = None

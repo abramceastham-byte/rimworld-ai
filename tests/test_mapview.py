@@ -91,12 +91,42 @@ class ViewTests(unittest.TestCase):
 
 
 class FreeSpotTests(unittest.TestCase):
-    def test_offers_clear_rectangles_near_the_base(self) -> None:
+    def test_offers_five_big_open_rectangles_near_the_base(self) -> None:
         spots = free_spots((30, 30), terrain(), DEFS, occupied=set())
-        self.assertEqual([letter for letter, _, _ in spots], ["A", "B", "C"])
-        for _, rect, note in spots:
-            self.assertTrue(rect.contains(rect.x1, rect.z1))
-            self.assertIn("crops", note)
+        self.assertEqual([letter for letter, _, _ in spots], ["A", "B", "C", "D", "E"])
+        first = spots[0][1]
+        self.assertEqual((first.x2 - first.x1 + 1, first.z2 - first.z1 + 1), (15, 15))  # as big as allowed
+        self.assertTrue(first.contains(30, 30) or first.contains(29, 29))                # right at the base
+        self.assertIn("15x15 open, fertile throughout, crops can grow", spots[0][2])
+        for _, rect, _ in spots:
+            self.assertLessEqual(max(rect.x2 - rect.x1, rect.z2 - rect.z1) + 1, 15)
+            self.assertGreaterEqual(min(rect.x2 - rect.x1, rect.z2 - rect.z1) + 1, 3)
+
+    def test_the_rectangle_fits_the_space_there(self) -> None:
+        # Only a 6x4 pocket is free: that is what's offered, not a fixed 3x3 or 5x5.
+        free = {(x, z) for x in range(20, 26) for z in range(20, 24)}
+        occupied = {(x, z) for x in range(60) for z in range(60)} - free
+        (letter, rect, note), = free_spots((22, 22), terrain(), DEFS, occupied)
+        self.assertEqual(rect, Rect(20, 20, 25, 23))
+        self.assertTrue(note.startswith("6x4 open"))
+
+    def test_cells_the_game_reports_are_ruled_out(self) -> None:
+        # e.g. a zone this agent didn't make, which RIMAPI reports one cell of at a time.
+        in_game = {(31, 31), (32, 32)}
+        asked = []
+
+        def blocked_in(rect):
+            asked.append(rect)
+            return {c for c in in_game if rect.contains(*c)}
+
+        spots = free_spots((30, 30), terrain(), DEFS, set(), blocked_in=blocked_in)
+        for _, rect, _ in spots:
+            self.assertFalse(any(rect.contains(*c) for c in in_game))
+        self.assertLessEqual(len(asked), 12)
+
+    def test_soil_is_described(self) -> None:
+        gravel = TerrainMap(60, 60, PALETTE, [3600, 2])  # fertility 0.4
+        self.assertIn("poor soil, no crops", free_spots((30, 30), gravel, DEFS, set())[0][2])
 
     def test_skips_occupied_cells_and_water(self) -> None:
         occupied = {(x, z) for x in range(25, 36) for z in range(25, 36)}
@@ -117,3 +147,44 @@ class FreeSpotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReachTests(unittest.TestCase):
+    """RIMAPI reports one cell per zone; the whole area it could cover is ruled out."""
+
+    def test_a_reported_zone_rules_out_its_possible_extent(self) -> None:
+        from types import SimpleNamespace
+        from rimagent.agent import reach_of_issues
+        zone = SimpleNamespace(x=10, z=10, label="Stockpile 5")
+        cells = reach_of_issues(SimpleNamespace(terrain=[], ores=[], buildings=[], zones=[zone]),
+                                {"Stockpile 5": 25})
+        self.assertEqual(len(cells), 81)  # a 25-cell zone reaches 4 cells around: 9x9
+        self.assertIn((14, 6), cells)
+        self.assertNotIn((15, 10), cells)
+
+    def test_rock_is_exact_and_buildings_reach_two(self) -> None:
+        from types import SimpleNamespace
+        from rimagent.agent import reach_of_issues
+        rock = SimpleNamespace(x=3, z=3)
+        bench = SimpleNamespace(x=20, z=20)
+        cells = reach_of_issues(SimpleNamespace(terrain=[], ores=[rock], buildings=[bench], zones=[]), {})
+        self.assertIn((3, 3), cells)
+        self.assertNotIn((4, 3), cells)
+        self.assertEqual(len([c for c in cells if c != (3, 3)]), 25)
+
+    def test_a_spot_is_only_offered_once_the_game_finds_nothing_in_it(self) -> None:
+        field = {(x, z) for x in range(28, 33) for z in range(28, 33)}  # a 25-cell zone at the base
+
+        def blocked_in(rect):
+            first = next((c for c in sorted(field) if rect.contains(*c)), None)  # one cell, as RIMAPI does
+            if first is None:
+                return set()
+            from types import SimpleNamespace
+            from rimagent.agent import reach_of_issues
+            zone = SimpleNamespace(x=first[0], z=first[1], label="field")
+            return reach_of_issues(SimpleNamespace(terrain=[], ores=[], buildings=[], zones=[zone]), {"field": 25})
+
+        spots = free_spots((30, 30), terrain(), DEFS, set(), blocked_in=blocked_in)
+        self.assertEqual(len(spots), 5)
+        for _, rect, _ in spots:
+            self.assertFalse(any(rect.contains(*c) for c in field))
