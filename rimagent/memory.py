@@ -1,5 +1,6 @@
 """Persistent and working memory for the colony agent."""
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -53,6 +54,21 @@ class PersistentMemoryState(BaseModel):
 
 
 PLAN_KEY = "(the whole plan)"
+
+# Openings that report this turn rather than state a lesson, and details that
+# go stale: coordinates and stock counts. A run's memory filled with lines like
+# "Placed TorchLamp adjacent to research bench..." and "current stocks: 155 WoodLog".
+DIARY_OPENINGS = ("placed", "planned", "planning", "plan to", "planning to", "created", "established",
+                  "built", "building", "designated", "ordered", "scheduled", "set up", "added", "assigned",
+                  "enabled", "started", "queued", "marked", "allowed", "will ")
+DIARY_DETAIL = re.compile(r"\(\s*\d+\s*,\s*\d+\s*\)|\b\d+\s*(WoodLog|Steel|Blocks\w+|Component\w*|Medicine\w*|ticks)\b"
+                          r"|\bcurrent stocks?\b", re.IGNORECASE)
+
+
+def diary_like(observation: str) -> bool:
+    """True when an observation reports this turn instead of stating a lasting lesson."""
+    text = observation.strip().lower()
+    return text.startswith(DIARY_OPENINGS) or bool(DIARY_DETAIL.search(observation))
 
 
 def held_until_confirmed(plan: CurrentPlan, previous: CurrentPlan | None,
@@ -166,12 +182,22 @@ class AgentMemory:
 
     def apply_update(
         self, step: int, game_tick: int, update: MemoryUpdate | None
-    ) -> None:
-        """Apply a model-proposed update to the Markdown and JSON stores."""
+    ) -> str | None:
+        """Apply a model-proposed update to the Markdown and JSON stores.
+
+        Returns a note for the next prompt when the observation was turned
+        away as a diary entry (see diary_like), else None.
+        """
         if update is None:
-            return
+            return None
 
         observation = (update.observation or "").strip()
+        note = None
+        if observation and diary_like(observation):
+            note = ("Memory observation not saved: \"" + observation[:80] + "\" reads like a log of this turn "
+                    "(what you placed or planned, stock numbers, coordinates). Save lessons that stay true, "
+                    "e.g. \"colonists prefer beds inside a room to beds outdoors\".")
+            observation = ""
         if observation:
             with self.observations_path.open("a", encoding="utf-8") as observations:
                 observations.write(
@@ -207,6 +233,7 @@ class AgentMemory:
                 known_policies.add(clean_policy.casefold())
 
         self._save_state()
+        return note
 
     def _observation_prompt(self) -> str:
         observations = self.observations_path.read_text(encoding="utf-8") if self.observations_path.exists() else ""

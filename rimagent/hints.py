@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from rimagent.choices import incapable_work
 from rimagent.construction import BUILDINGS, FLOORS, Rect, footprint
+from rimagent.mapview import biggest_rect
 from rimagent.observation import PLENTY_OF_STORAGE
 from rimagent.rooms import NEXT, inside_of
 from rimagent.supplies import commitments, how_to_get, stock_by_def
@@ -156,7 +157,7 @@ def stockpile_refusal(action, facts: TurnFacts) -> str | None:
 
 
 def pending_work(facts: TurnFacts, research, tables, live_zones, chop_orders: int,
-                 short: set[str]) -> list[tuple[str, str, bool]]:
+                 short: set[str], mine_orders: int = 0) -> list[tuple[str, str, bool]]:
     """(work type, what is waiting, blocked) for everything already ordered."""
     pending = []
     waiting = facts.unfinished()
@@ -167,6 +168,8 @@ def pending_work(facts: TurnFacts, research, tables, live_zones, chop_orders: in
                         bool(stuck) and all(bp.stuff in short for bp in waiting)))
     if chop_orders:
         pending.append(("PlantCutting", f"{chop_orders} trees ordered cut", False))
+    if mine_orders:
+        pending.append(("Mining", f"{mine_orders} rock cells marked", False))
     fields = sum(1 for z in live_zones if "Growing" in z.type)
     if fields:
         pending.append(("Growing", f"{fields} growing zones", False))
@@ -266,9 +269,30 @@ def failure_hint(action, error: str, facts: TurnFacts) -> tuple[str, bool]:
         return ("Nothing to do: there's room to spare. For better storage, build_room with purpose storage, "
                 "place Shelf blueprints inside, and create_stockpile over its inside (that is always allowed).",
                 False)
+    if kind == "create_stockpile" and "blocked by" in error:
+        return clear_part_hint(action.rect(), facts), False
     if kind == "create_stockpile":
         return f"Free spots this turn: {spot_list(facts) or 'none'}.", False
     return "", True
+
+
+def clear_part_hint(rect: Rect, facts: TurnFacts) -> str:
+    """For a stockpile over buildings: the largest clear rectangle inside the area.
+
+    A model built a storage room, put a shelf in it, then asked three times for
+    a stockpile over the whole inside. A shelf can't be inside a stockpile: it
+    stores things by itself.
+    """
+    taken = {c for b in facts.buildings for c in b.area()}
+    taken |= {c for bp in facts.unfinished() for c in bp.area()}
+    free = {c for c in rect if c not in taken}
+    best = biggest_rect(free, (rect.x1, rect.z1, rect.x2, rect.z2), ((rect.x1 + rect.x2) // 2, (rect.z1 + rect.z2) // 2))
+    text = "Shelves and other buildings can't be inside a stockpile; a shelf stores things by itself. "
+    if best:
+        text += f"The largest clear part of that area is {best}: create_stockpile there. "
+    else:
+        text += "No clear 3x3 part is left there, so the shelves are that room's storage. "
+    return text + "Next time make the stockpile first: a shelf built on it then takes over its own cells."
 
 
 def construction_hint(action, submitted: list[dict], facts: TurnFacts) -> str:

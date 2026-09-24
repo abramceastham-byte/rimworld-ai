@@ -13,10 +13,12 @@ from rimagent.actions import Turn
 from rimagent.blueprints import BlueprintTracker, Status, TrackedBlueprint
 from rimagent.choices import Choices, FailureMemory, incapable_work
 from rimagent.chopping import ChopTracker
+from rimagent.mining import MineTracker
 from rimagent.hints import (IdleTracker, TurnFacts, failure_hint, idle_hint, pending_work, stockpile_refusal,
                             storage_hint, success_hint)
 from rimagent.rooms import RoomTracker
 from rimagent.construction import (
+    BUILDING_USE,
     BUILDINGS,
     CROPS,
     FLOORS,
@@ -79,6 +81,10 @@ GAME_FACTS = """Rules:
 - A blueprint is an order, not a finished building. Blueprints can't be moved or cancelled from here:
   placing one again makes a second copy. A room is a closed ring of walls with a door; colonists
   roof it automatically once it is closed, so never wall in a growing zone.
+- Layout: keep the colony compact and convenient, since colonists walk to everything. Before placing a
+  building, look at what surrounds the spot: put it near what it works with (beds inside bedrooms,
+  the stove by the dining room and food storage, work tables near their materials' stockpile), keep
+  doors and walkways clear, and leave room for the rooms you will add next.
 """
 
 INSTRUCTIONS = """You are the colony's manager, not a colonist. Your orders are standing orders: the research
@@ -125,6 +131,7 @@ Fields (inclusive rectangles use x1,z1,x2,z2; x east, z north):
 Actions without usable targets are excluded from this turn's schema; unavailable capabilities are listed.
 memory_update keeps what matters for the whole game, not a diary of this turn:
 - observation: a big discovery or idea worth remembering for the rest of the colony's life, e.g.
+  "colonists prefer beds inside a room to beds outdoors",
   "colonists are happier with a bedroom each than sharing", "colonists are comfortable between
   16 and 26 C", "raids have come from the east edge". Not what you ordered or what happened this
   turn, and no numbers the prompt shows every turn (stock, jobs, ticks): those go stale.
@@ -551,7 +558,8 @@ def describe_map(
     lines += ["", heading]
     for name, spec in buildable.items():
         label = "" if spec.label.replace(" ", "").lower() == name.lower() else f" ({spec.label})"
-        lines.append(f"- {name}{label}, {spec.size[0]}x{spec.size[1]}, {spec.cost_text()}")
+        use = f" - {BUILDING_USE[name]}" if name in BUILDING_USE else ""
+        lines.append(f"- {name}{label}, {spec.size[0]}x{spec.size[1]}, {spec.cost_text()}{use}")
 
     lines.append(
         "Stuff materials: "
@@ -806,7 +814,7 @@ def room_state(buildings, report) -> tuple[dict, list]:
 
 def prepare_turn(client, memory, blueprints, zones, mode, window=None,
                  run_ticks=RUN_TICKS, threat_run_ticks=THREAT_RUN_TICKS, new_events=(), last_results=(), failures=None,
-                 read_only=False, learned_incapable=None, chops=None, rooms=None, idle=None):
+                 read_only=False, learned_incapable=None, chops=None, rooms=None, idle=None, mines=None):
     """Observe the game and build this turn's prompt and choices.
 
     Shared by live play and dry runs; with read_only=True nothing is saved,
@@ -835,6 +843,13 @@ def prepare_turn(client, memory, blueprints, zones, mode, window=None,
         chop_line = chops.describe(state.game_tick, cutters)
         if chop_line:
             operations.lines.append(chop_line)
+    if mines is not None and "mine" in operations.targets:
+        mines.reconcile({(t["x"], t["z"]) for t in operations.targets["mine"]})
+        miners = [c.name for c in colonists
+                  if any(w.work_type == "Mining" and w.priority > 0 for w in c.work_priorities)]
+        mine_line = mines.describe(miners)
+        if mine_line:
+            operations.lines.append(mine_line)
     unknown = [z for z in live_zones if z.id not in {k.zone_id for k in known_zones}]
     if unknown:
         operations.lines.append("Zones with unknown/edited geometry (placement checks still protect them): " +
@@ -913,7 +928,7 @@ def prepare_turn(client, memory, blueprints, zones, mode, window=None,
     if idle is not None:
         unfinished = [dict(def_name=bp.def_name, stuff=bp.stuff, floor=bp.floor) for bp in facts.unfinished()]
         pending = pending_work(facts, research, tables, live_zones, len(chops.orders) if chops else 0,
-                               short_materials(items, stored, unfinished))
+                               short_materials(items, stored, unfinished), len(mines.cells) if mines else 0)
         capable = {c.name: set(work_types) - incapable_work(c, learned_incapable) for c in colonists}
         idle_line = idle_hint(idle.update(colonists), facts, pending, capable)
         if idle_line:
@@ -948,6 +963,7 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
     blueprints = BlueprintTracker(memory.memory_dir / "blueprints.json")
     zones = ZoneTracker(memory.memory_dir / "zones.json")
     chops = ChopTracker(memory.memory_dir / "chops.json")
+    mines = MineTracker(memory.memory_dir / "mining.json")
     rooms = RoomTracker(memory.memory_dir / "rooms.json")
     idle = IdleTracker()
     failures = FailureMemory()
@@ -963,7 +979,7 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
             try:
                 context = prepare_turn(client, memory, blueprints, zones, mode, window,
                                        run_ticks, threat_run_ticks, new_events, last_results, failures,
-                                       learned_incapable=learned_incapable, chops=chops, rooms=rooms,
+                                       learned_incapable=learned_incapable, chops=chops, rooms=rooms, mines=mines,
                                        idle=idle)
             except (RimApiError, httpx.HTTPError, ValueError) as error:
                 logger.log_model_failure({"step": step, "failure_type": "observation_error", "error": str(error)})
@@ -983,9 +999,17 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
             results = []
             counts = {"OK": 0, "UNCHANGED": 0, "FAILED": 0}
             # Empty turns still retain prompt/reasoning/reply in logs.
+            seen: dict[str, int] = {}  # order -> its number, to catch repeats within this reply
             for index, action in enumerate(turn.actions or [None]):
                 error, result = None, "no orders"
-                if action is not None:
+                key = json.dumps(action.model_dump(exclude={"reason"}), sort_keys=True) if action else None
+                if action is not None and key in seen:
+                    # One turn sent enable_work Squint Crafting five times.
+                    result = f"unchanged: the same order as #{seen[key]} in this reply, so it wasn't sent again"
+                    counts["UNCHANGED"] += 1
+                    results.append(f"#{index + 1} UNCHANGED: {result.removeprefix('unchanged: ')}")
+                elif action is not None:
+                    seen[key] = index + 1
                     # Every order is tried, even after a failure: the game refuses
                     # one that relied on it, and the report says which worked.
                     try:
@@ -993,7 +1017,7 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
                         if refusal:
                             raise ValueError(refusal)
                         result = execute(client, action, blueprints, zones, context['operations'],
-                                         learned_incapable, chops)
+                                         learned_incapable, chops, mines)
                         if action.action == "build_room" and not result.startswith("unchanged"):
                             rooms.add(action.rect(), action.purpose, action.door_side)
                         hint = success_hint(action, result, client.submitted_blueprints, context['facts'])
@@ -1032,7 +1056,9 @@ def run(client: RimApiClient, model: Callable[[str], str], logger: RunLogger,
                              f"{counts['FAILED']} FAILED."] + results) if results else []
             # Plan and policies are always kept; a step reported completed is
             # held until a later turn confirms it (see memory.held_until_confirmed).
-            memory.apply_update(step, context['state'].game_tick, turn.memory_update)
+            memory_note = memory.apply_update(step, context['state'].game_tick, turn.memory_update)
+            if memory_note:
+                last_results.append(memory_note)
             mode = mode_after_decision(mode, turn.time)
             if turn.time == 'hold':
                 window = None

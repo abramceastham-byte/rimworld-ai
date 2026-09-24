@@ -20,6 +20,7 @@ from rimagent.agent import TimeMode, Turn, prepare_turn
 from rimagent.blueprints import BlueprintTracker
 from rimagent.chopping import ChopTracker
 from rimagent.rooms import RoomTracker
+from rimagent.mining import MineTracker
 from rimagent.zones import ZoneTracker
 from rimagent.memory import AgentMemory
 from rimagent.ollama_model import OllamaModel, parse_think
@@ -35,7 +36,8 @@ def live_context(client: RimApiClient) -> dict:
         ZoneTracker(memory.memory_dir / "zones.json"),
         TimeMode(True, "session start"), read_only=True,
         chops=ChopTracker(memory.memory_dir / "chops.json", read_only=True),
-        rooms=RoomTracker(memory.memory_dir / "rooms.json", read_only=True))
+        rooms=RoomTracker(memory.memory_dir / "rooms.json", read_only=True),
+        mines=MineTracker(memory.memory_dir / "mining.json", read_only=True))
 
 
 def live_prompt(client: RimApiClient) -> str:

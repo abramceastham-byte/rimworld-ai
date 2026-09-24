@@ -108,6 +108,26 @@ BUILDINGS = {
     "ChessTable": BuildSpec("chess table", stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture", stuff_count=70),
 }
 
+# What each building is for, shown in the buildable list. A model took the
+# stonecutter's table for a "mining table" that would let colonists mine steel.
+BUILDING_USE = {
+    "TableButcher": "butchers corpses into meat, makes kibble",
+    "FueledStove": "cooks meals; burns wood as fuel",
+    "ElectricStove": "cooks meals; needs power",
+    "SimpleResearchBench": "where colonists research",
+    "HandTailoringBench": "makes clothes from cloth or leather",
+    "TableStonecutter": "cuts stone chunks into stone blocks; it does not mine (mining is designate mine plus Mining work)",
+    "Shelf": "stores items by itself, more per cell than the floor; not inside a stockpile",
+    "WoodFiredGenerator": "makes power; burns wood as fuel; needs conduits to what it powers",
+    "StandingLamp": "light; needs power",
+    "TorchLamp": "light; burns wood as fuel; research does not need it",
+    "PassiveCooler": "cools a room; burns wood as fuel",
+    "Campfire": "cooks simple meals and gives heat; burns wood as fuel",
+    "HorseshoesPin": "recreation",
+    "ChessTable": "recreation; needs a chair",
+}
+
+
 @dataclass(frozen=True)
 class FloorSpec:
     label: str

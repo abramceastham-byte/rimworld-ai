@@ -7,13 +7,14 @@ from rimagent.hints import ONE_AT_A_TIME
 from rimagent.rimapi import RimApiError
 
 
-def execute(client, action, blueprints, zones, operations, learned_incapable=None, chops=None):
+def execute(client, action, blueprints, zones, operations, learned_incapable=None, chops=None, mines=None):
     """Carry out one order against freshly read state, and say what it did.
 
     Returns "unchanged: ..." when the game already matches, or what was
     verified or merely submitted. Raises ValueError/RimApiError on failure.
     learned_incapable collects work RIMAPI refused, for later turns' choices;
-    chops (a ChopTracker) remembers which trees were ordered cut.
+    chops (a ChopTracker) remembers which trees were ordered cut, mines (a
+    MineTracker) which rock was marked for mining.
     Does not advance the game clock.
     """
     client.begin_snapshot()
@@ -134,8 +135,19 @@ def execute(client, action, blueprints, zones, operations, learned_incapable=Non
             here = client.get_things_at(action.x1, action.z1)
             if not any(t.thing_id == m['id'] for t in here for m in matches):
                 raise ValueError("animal moved; choose a fresh target")
-        client.designate(action.designation, action.rect())
-        detail = "designation submitted; API cannot verify changed count; previously marked/ineligible targets may be unchanged"
+        if action.designation == "mine" and mines is not None:
+            fresh = [t for t in matches if (t["x"], t["z"]) not in mines.cells]
+            if not fresh:
+                return (f"unchanged: {target}: all {len(matches)} rock cells there are already marked for mining; "
+                        "see 'Mining you ordered' for what became of them")
+            client.designate(action.designation, action.rect())
+            mines.add(fresh)
+            already = len(matches) - len(fresh)
+            detail = (f"marked {len(fresh)} rock cells for mining" + (f" ({already} there already were)" if already else "")
+                      + "; colonists with Mining on dig them out while time advances")
+        else:
+            client.designate(action.designation, action.rect())
+            detail = "designation submitted; API cannot verify changed count; previously marked/ineligible targets may be unchanged"
     else:
         methods = {
             "place_blueprint": lambda: client.place_blueprint(action.building_def, action.x, action.z, action.rotation, action.stuff),
