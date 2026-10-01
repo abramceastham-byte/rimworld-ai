@@ -5,7 +5,8 @@ from dataclasses import dataclass, field
 
 from rimagent.actions import Turn
 from rimagent.construction import CROPS, FLOORS, available_buildings, stuff_rank
-from rimagent.supplies import ALL_STUFF, how_to_get, usable_stuff
+from rimagent.finish import FOOD, is_food
+from rimagent.supplies import ALL_STUFF, how_to_get, unlockable_stuff, usable_stuff
 
 # The skill each work type trains (RimWorld's WorkTypeDef.relevantSkills). A
 # totally disabled skill means the colonist can't do that work at all.
@@ -40,7 +41,7 @@ class Choices:
 
     @classmethod
     def observe(cls, colonists, work_types, tables, research, defs, terrain,
-                items, trees, target_kinds=(), learned_incapable=None):
+                items, trees, target_kinds=(), learned_incapable=None, enemies=(), power_ready=False):
         c = cls(width=terrain.width, height=terrain.height)
         c.work = {p.name: set(work_types) - incapable_work(p, learned_incapable) for p in colonists}
         # Standing orders already in effect aren't offered again: a run asked
@@ -70,7 +71,9 @@ class Choices:
         finished = {p.name for p in research.all_projects if p.is_finished}
         # Only materials the colony can use now: offering every stone block
         # let models plan whole rooms in blocks nobody had.
-        usable = usable_stuff(items)
+        # Forbidden materials count: allow_items makes them usable, and it may
+        # come in the same reply, since a blueprint only waits for materials.
+        usable = {**usable_stuff(items), **unlockable_stuff(items)}
         c.materials = {name: ([m for m in spec.materials() if m in defs.thing_names and m in usable]
                              if spec.materials() else [None])
                        for name, spec in available_buildings(finished).items()
@@ -101,8 +104,11 @@ class Choices:
         if crops:
             c.fields["create_growing_zone"] = {"plant": crops}
         c.fields["create_stockpile"] = {}
-        if any(i.is_forbidden for i in items):
-            c.fields["allow_items"] = {}
+        c.fields["plan_area"] = {}
+        forbidden = sorted({i.def_name for i in items if i.is_forbidden})
+        if forbidden:
+            food = [FOOD] if any(is_food(name) for name in forbidden) else []
+            c.fields["allow_items"] = {"what": ["all", *food, *forbidden]}
         else:
             c.unavailable.append("allow_items: no forbidden items")
         if trees:
@@ -114,15 +120,68 @@ class Choices:
         for kind in ("mine", "harvest", "hunt"):
             if kind not in target_kinds:
                 c.unavailable.append(f"designate {kind}: no verified targets")
+        c.add_pawn_orders(colonists, items, enemies, power_ready)
         return c
 
-    def schema(self):
-        schema = deepcopy(Turn.model_json_schema())
+    def add_pawn_orders(self, colonists, items, enemies, power_ready: bool) -> None:
+        """Draft, move, attack, equip, medical orders and connect_power."""
+        names = [p.name for p in colonists]
+        if names:
+            self.fields["draft"] = {"colonist": names}
+            self.fields["move"] = {"colonist": names}
+        if names and enemies:
+            self.fields["attack"] = {"colonist": names, "target": [e.id for e in enemies]}
+        elif names:
+            self.unavailable.append("attack: no enemy on the map")
+        weapons = [i.thing_id for i in items if i.is_weapon]
+        if names and weapons:
+            self.fields["equip"] = {"colonist": names, "item_id": weapons}
+        elif names:
+            self.unavailable.append("equip: no weapons lying on the map")
+        injured = [p.name for p in colonists if p.health < 0.99]
+        doctors = [n for n in names if "Doctor" in self.work.get(n, set())]
+        if injured:
+            self.fields["tend"] = {"patient": injured, "doctor": doctors + [None]}
+            self.fields["bed_rest"] = {"patient": injured}
+        else:
+            self.unavailable += ["tend: nobody is injured", "bed_rest: nobody is injured"]
+        if len(names) > 1 and any(p.health < 0.6 for p in colonists):
+            self.fields["rescue"] = {"colonist": names, "patient": [p.name for p in colonists if p.health < 0.6]}
+        else:
+            self.unavailable.append("rescue: nobody is badly hurt")
+        if power_ready:
+            self.fields["connect_power"] = {}
+        else:
+            self.unavailable.append("connect_power: needs Electricity research and a generator or battery")
+
+    def withhold(self, buildings: set[str], why: str) -> None:
+        """Stop offering these buildings to place_blueprint, saying why.
+
+        Taken off the menu rather than refused: a refused order comes back turn
+        after turn, an order that isn't offered can't be sent.
+        """
+        offered = [b for b in buildings if b in self.materials]
+        if not offered:
+            return
+        for name in offered:
+            del self.materials[name]
+        if "place_blueprint" in self.fields:
+            defs = [d for d in self.fields["place_blueprint"]["building_def"] if d not in buildings]
+            if defs:
+                self.fields["place_blueprint"]["building_def"] = defs
+            else:
+                del self.fields["place_blueprint"]
+        self.unavailable.append(f"place_blueprint {' / '.join(sorted(offered))}: {why}")
+
+    def schema(self, allowed: set[str] | None = None, turn_model=Turn):
+        """The JSON schema for this turn's reply: only offered orders (and, when
+        given, only those in allowed), with every name narrowed to what exists."""
+        schema = deepcopy(turn_model.model_json_schema())
         branches = []
         for spec in schema["$defs"].values():
             props = spec.get("properties", {})
             action = props.get("action", {}).get("const")
-            if action not in self.fields:
+            if action not in self.fields or (allowed is not None and action not in allowed):
                 continue
             branch = deepcopy(spec)
             for name, values in self.fields[action].items():
@@ -170,8 +229,10 @@ class Choices:
                            if "action" not in v.get("properties", {})}
         return schema
 
-    def validate(self, turn: Turn):
+    def validate(self, turn: Turn, allowed: set[str] | None = None):
         for a in turn.actions:
+            if allowed is not None and a.action not in allowed:
+                raise ValueError(f"{a.action} isn't one of this turn's orders; request its toolkit first")
             if self.already_in_effect(a):
                 # Not offered by the schema; without one, let it through to be
                 # reported "unchanged" rather than throw away the whole reply.

@@ -29,10 +29,10 @@ def order(**fields):
 
 
 class TimeWindowTests(unittest.TestCase):
-    def test_a_turn_is_eight_real_seconds_at_speed_3(self) -> None:
-        self.assertEqual(RUN_TICKS / (6 * TICKS_PER_SECOND), 8)  # speed 3 runs 6x normal
-        self.assertEqual(RUN_TICKS, 2880)
-        self.assertEqual(THREAT_RUN_TICKS, 864)                    # 30% while a threat is active
+    def test_a_turn_is_an_hour_and_a_half_of_game_time(self) -> None:
+        self.assertEqual(RUN_TICKS, 3750)                          # 1.5 in-game hours
+        self.assertAlmostEqual(RUN_TICKS / (6 * TICKS_PER_SECOND), 10.4, places=1)  # speed 3 runs 6x normal
+        self.assertEqual(THREAT_RUN_TICKS, 1125)                   # 30% while a threat is active
 
 
 class ChopTrackerTests(unittest.TestCase):
@@ -52,7 +52,19 @@ class ChopTrackerTests(unittest.TestCase):
         chops.add([tree(1, 5, 5), tree(2, 9, 8)], tick=1000)
         chops.reconcile([tree(1, 5, 5), tree(2, 9, 8)])
         line = chops.describe(1000 + STALE_TICKS, ["Squint"])
-        self.assertIn("2 of them ordered 2+ in-game hours ago, within (5,5)-(9,8): most likely too young", line)
+        self.assertIn("2 of them ordered 2+ in-game hours ago, within (5,5)-(9,8), and none has fallen", line)
+        self.assertIn("too young", line)
+
+    def test_old_orders_are_not_blamed_on_youth_while_trees_still_fall(self) -> None:
+        # One run was told "most likely too young" ten turns running while its wood went from 0 to 518.
+        chops = ChopTracker()
+        chops.add([tree(1, 5, 5), tree(2, 9, 8), tree(3, 6, 6)], tick=1000)
+        chops.reconcile([tree(1, 5, 5), tree(2, 9, 8), tree(3, 6, 6)], tick=1000, wood=0)
+        chops.reconcile([tree(1, 5, 5), tree(2, 9, 8)], tick=1000 + STALE_TICKS, wood=25)
+        line = chops.describe(1000 + STALE_TICKS, ["Squint"])
+        self.assertIn("trees are still falling", line)
+        self.assertNotIn("too young", line)
+        self.assertIn("Allowed WoodLog on the map: 25 (+25 since last turn)", line)
 
     def test_says_when_nobody_can_cut(self) -> None:
         chops = ChopTracker()
@@ -157,7 +169,7 @@ class RoomDoorTests(MapTestCase):
         self.assertEqual(fake.writes(), [])
 
     def test_the_size_error_explains_outer_versus_inside(self) -> None:
-        with self.assertRaisesRegex(ValueError, "outer 4x4 leaves 2x2 inside"):
+        with self.assertRaisesRegex(ValueError, "walls included; the inside is 2 smaller each way"):
             room_layout(Rect(0, 0, 2, 2), "north")
 
 

@@ -97,7 +97,7 @@ class FreeSpotTests(unittest.TestCase):
         first = spots[0][1]
         self.assertEqual((first.x2 - first.x1 + 1, first.z2 - first.z1 + 1), (15, 15))  # as big as allowed
         self.assertTrue(first.contains(30, 30) or first.contains(29, 29))                # right at the base
-        self.assertIn("15x15 open, fertile throughout, crops can grow", spots[0][2])
+        self.assertIn("15x15 open, fertile throughout", spots[0][2])
         for _, rect, _ in spots:
             self.assertLessEqual(max(rect.x2 - rect.x1, rect.z2 - rect.z1) + 1, 15)
             self.assertGreaterEqual(min(rect.x2 - rect.x1, rect.z2 - rect.z1) + 1, 3)

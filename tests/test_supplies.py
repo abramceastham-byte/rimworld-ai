@@ -38,8 +38,9 @@ class SupplyTests(unittest.TestCase):
         lines = describe_supplies(ITEMS, STORED)
         self.assertIn("Colony stock (allowed, in stockpiles and shelves, as the game's resource "
                       "readout shows): WoodLog 120, Steel 75.", lines)
-        self.assertIn("Also allowed but outside storage (usable; colonists fetch it): "
-                      "ChunkSandstone 559, Steel 45.", lines)
+        self.assertIn("Also allowed but outside storage (usable; colonists fetch it): Steel 45; stone chunks "
+                      "(clutter, not building material: a stonecutter's table can cut them into stone blocks, 20 "
+                      "per chunk): ChunkSandstone 559.", lines)
         self.assertIn("Forbidden, unusable until allow_items: Steel 720.", lines)
 
     def test_stored_entries_that_are_not_loose_items_are_ignored(self) -> None:
@@ -57,16 +58,27 @@ class SupplyTests(unittest.TestCase):
     def test_chunks_are_mentioned_once_without_pushing_a_stonecutter(self) -> None:
         # Told in four places to build a stonecutter's table, a model planned ten.
         plain = describe_supplies(ITEMS, STORED, (), {"Stonecutting"})[-1]
-        self.assertEqual(plain, "Stone chunks (ChunkSandstone 559) are not building material; build in wood.")
-        self.assertNotIn("TableStonecutter", " ".join(describe_supplies(ITEMS, STORED, (), {"Stonecutting"})))
+        self.assertEqual(plain, "Stone chunks (ChunkSandstone 559) are clutter, not building material; build in wood.")
+        text = " ".join(describe_supplies(ITEMS, STORED, (), {"Stonecutting"}))
+        self.assertNotIn("TableStonecutter", text)
+        self.assertEqual(text.count("stonecutter"), 1)  # beside the chunks, where they are listed
         planned = describe_supplies(ITEMS, STORED, (), set(), [dict(def_name="TableStonecutter", stuff="WoodLog")])
         self.assertIn("Your stonecutter's table is planned", planned[-1])
         built = describe_supplies(ITEMS, STORED, [STONECUTTER])[-1]
         self.assertIn("Your stonecutter's table can cut them into blocks (20 per chunk) with a bill such as "
                       "Make_StoneBlocksSandstone, if you want stone.", built)
 
+    def test_chunks_are_explained_in_full_once_then_briefly(self) -> None:
+        # The overview listed "ChunkSandstone 559" without the chunk line, and a model planned a bedroom in chunks.
+        items = ITEMS + [stack(6, "ChunkGranite", 40, forbidden=True)]
+        lines = describe_supplies(items, STORED)
+        self.assertIn("stone chunks (clutter, not building material: a stonecutter's table", lines[1])
+        self.assertIn("Steel 720; stone chunks (clutter, not building material): ChunkGranite 40.", lines[2])
+
     def test_without_the_stored_read_everything_allowed_is_one_line(self) -> None:
-        self.assertIn("Allowed items on the map (usable): ChunkSandstone 559, WoodLog 120, Steel 120.",
+        self.assertIn("Allowed items on the map (usable): WoodLog 120, Steel 120; stone chunks (clutter, not "
+                      "building material: a stonecutter's table can cut them into stone blocks, 20 per chunk): "
+                      "ChunkSandstone 559.",
                       describe_supplies(ITEMS, None))
 
     def test_how_to_get_each_kind_of_material(self) -> None:
@@ -100,12 +112,23 @@ class ChoiceMaterialTests(MapTestCase):
         terrain = TerrainMap(WIDTH, HEIGHT, PALETTE, terrain_grid())
         return Choices.observe([colonist()], WORK_TYPES, [], RESEARCH, defs, terrain, items, [], ())
 
+    def test_allow_items_offers_only_forbidden_names(self) -> None:
+        c = self.choices([stack(1, "WoodLog", 100, forbidden=True), stack(2, "MealSurvivalPack", 5, forbidden=True),
+                          stack(3, "Steel", 300)])
+        self.assertEqual(c.fields["allow_items"]["what"], ["all", "Food", "MealSurvivalPack", "WoodLog"])
+
     def test_only_materials_the_colony_has_are_offered(self) -> None:
         c = self.choices([stack(1, "WoodLog", 100), stack(2, "ChunkSandstone", 500),
                           stack(3, "Steel", 300, forbidden=True)])
+        # Forbidden Steel is one allow_items away, so it is offered; stone blocks nobody has are not.
+        self.assertEqual(c.fields["build_room"]["stuff"], ["WoodLog", "Steel"])
+        self.assertEqual(c.materials["Wall"], ["WoodLog", "Steel"])
+        self.assertFalse(any("stuff Steel" in u for u in c.unavailable))
+
+    def test_forbidden_wood_alone_still_offers_rooms(self) -> None:
+        # Live (gpt-oss): 300 forbidden wood, no build_room offered, so it planned 17 single walls.
+        c = self.choices([stack(1, "WoodLog", 300, forbidden=True)])
         self.assertEqual(c.fields["build_room"]["stuff"], ["WoodLog"])
-        self.assertEqual(c.materials["Wall"], ["WoodLog"])
-        self.assertTrue(any("stuff Steel: none usable" in u for u in c.unavailable))
 
     def test_the_schema_offers_wood_first(self) -> None:
         c = self.choices([stack(1, "WoodLog", 100), stack(2, "Steel", 300)])
@@ -207,5 +230,5 @@ class MaterialOrderTests(unittest.TestCase):
     def test_wood_and_stone_come_before_steel(self) -> None:
         self.assertEqual(BUILDINGS["Wall"].materials()[0], "WoodLog")
         self.assertEqual(BUILDINGS["Wall"].materials()[-1], "Steel")
-        self.assertEqual(BUILDINGS["Wall"].cost_text(), "5 of WoodLog/stone blocks/Steel")
-        self.assertEqual(BUILDINGS["TableButcher"].cost_text(), "75 of WoodLog/Steel + 20 WoodLog")
+        self.assertEqual(BUILDINGS["Wall"].cost_text(), "5 WoodLog, stone blocks or Steel (stuff, pick one)")
+        self.assertEqual(BUILDINGS["TableButcher"].cost_text(), "75 WoodLog or Steel (stuff, pick one) + 20 WoodLog")

@@ -68,13 +68,16 @@ class BuildSpec:
         return [m for category in self.categories() for m in STUFF_BY_CATEGORY.get(category, [])]
 
     def cost_text(self) -> str:
-        """What it takes to build, e.g. "75 of WoodLog/stone blocks/Steel + 25 Steel"."""
+        """What it takes to build, e.g. "75 WoodLog, stone blocks or Steel (stuff, pick one) + 25 Steel".
+
+        "75 of WoodLog/Steel + 20 WoodLog" read as needing Steel too: gpt-oss
+        ruled out a butcher table for want of Steel with 300 wood to hand.
+        """
         parts = []
         if self.stuff_count:
-            kinds = "/".join(
-                "stone blocks" if c == "Stony" else STUFF_BY_CATEGORY[c][0] for c in self.categories()
-            )
-            parts.append(f"{self.stuff_count} of {kinds}")
+            kinds = ["stone blocks" if c == "Stony" else STUFF_BY_CATEGORY[c][0] for c in self.categories()]
+            choice = kinds[0] if len(kinds) == 1 else ", ".join(kinds[:-1]) + " or " + kinds[-1]
+            parts.append(f"{self.stuff_count} {choice} (stuff, pick one)")
         parts += [f"{count} {name}" for name, count in self.cost]
         return " + ".join(parts) or "nothing"
 
@@ -104,8 +107,16 @@ BUILDINGS = {
     "WoodFiredGenerator": BuildSpec("wood-fired generator", size=(2, 2), research="Electricity", cost=(("Steel", 100), ("ComponentIndustrial", 2))),
     "StandingLamp": BuildSpec("standing lamp", research="Electricity", cost=(("Steel", 20),)),
     "Barricade": BuildSpec("barricade", stuff=("Metallic", "Woody", "Stony"), stuff_count=5),
+    # Security tab (Buildings_Security.xml, Buildings_Security_Turrets.xml).
+    "TrapSpike": BuildSpec("spike trap", stuff=("Metallic", "Woody", "Stony"), stuff_count=45),
+    "Turret_MiniTurret": BuildSpec("mini-turret", stuff=("Metallic",), stuff_count=30, research="GunTurrets",
+                                   cost=(("Steel", 70), ("ComponentIndustrial", 3))),
     "HorseshoesPin": BuildSpec("horseshoes pin", stuff=("Metallic", "Woody", "Stony"), stuff_count=10),
     "ChessTable": BuildSpec("chess table", stuff=("Metallic", "Woody", "Stony"), research="ComplexFurniture", stuff_count=70),
+    # Laid by connect_power, which picks the route; listed so costs and hints know them.
+    "PowerConduit": BuildSpec("power conduit", research="Electricity", cost=(("Steel", 1),)),
+    "HiddenConduit": BuildSpec("hidden conduit", research="Electricity", cost=(("Steel", 2),)),
+    "Battery": BuildSpec("battery", size=(1, 2), research="Batteries", cost=(("Steel", 70), ("ComponentIndustrial", 2))),
 }
 
 # What each building is for, shown in the buildable list. A model took the
@@ -123,8 +134,15 @@ BUILDING_USE = {
     "TorchLamp": "light; burns wood as fuel; research does not need it",
     "PassiveCooler": "cools a room; burns wood as fuel",
     "Campfire": "cooks simple meals and gives heat; burns wood as fuel",
+    "Barricade": "defense: cover that drafted colonists shoot from behind; clears the Need defenses alert",
+    "TrapSpike": ("defense: hurts the first enemy to step on it; never next to another trap; clears the Need "
+                  "defenses alert"),
+    "Turret_MiniTurret": "defense: shoots enemies by itself; needs power and steel to reload",
     "HorseshoesPin": "recreation",
     "ChessTable": "recreation; needs a chair",
+    "PowerConduit": "carries power; use connect_power rather than placing these by hand",
+    "HiddenConduit": "carries power under open ground; use connect_power",
+    "Battery": "stores power from generators; link it with connect_power",
 }
 
 
@@ -224,8 +242,8 @@ def footprint(x: int, z: int, size: tuple[int, int], rotation: int) -> Rect:
 def room_layout(rect: Rect, door_side: str) -> list[tuple[str, int, int]]:
     """Outer walls with exactly one centred door, no duplicate corner cells."""
     if not (4 <= rect.x2 - rect.x1 + 1 <= 15 and 4 <= rect.z2 - rect.z1 + 1 <= 15):
-        raise ValueError("room outer dimensions must each be 4..15 cells, walls included: "
-                         "outer 4x4 leaves 2x2 inside, outer 5x5 leaves 3x3")
+        raise ValueError("room outer dimensions must each be 4..15 cells, walls included; the inside is 2 "
+                         "smaller each way")
     mx, mz = (rect.x1 + rect.x2) // 2, (rect.z1 + rect.z2) // 2
     doors = {"north": (mx, rect.z2), "south": (mx, rect.z1),
              "east": (rect.x2, mz), "west": (rect.x1, mz)}

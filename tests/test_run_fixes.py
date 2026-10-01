@@ -33,7 +33,7 @@ class StockpileOverShelfTests(unittest.TestCase):
         facts = TurnFacts(report=[(shelf, "waiting")])
         pile = order(action="create_stockpile", x1=116, z1=140, x2=118, z2=144)
         hint, keep = failure_hint(pile, "area (116,140)-(118,144) is blocked by shelf at (116,144)", facts)
-        self.assertIn("a shelf stores things by itself", hint)
+        self.assertIn("A shelf stores things by itself", hint)
         self.assertIn("The largest clear part of that area is (116,140)-(118,143): create_stockpile there.", hint)
         self.assertIn("Next time make the stockpile first", hint)
         self.assertFalse(keep)

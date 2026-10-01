@@ -172,10 +172,12 @@ class SuppliesTests(unittest.TestCase):
         self.assertEqual(stock_by_def(items, forbidden=False), {"WoodLog": 96})
         self.assertEqual(stock_by_def(items, forbidden=True), {"WoodLog": 220, "Steel": 480})
 
-        usable, locked, stuff = describe_supplies(items)
+        usable, locked, stuff, unlock = describe_supplies(items)
         self.assertIn("Allowed items on the map (usable): WoodLog 96.", usable)
         self.assertIn("Steel 480, WoodLog 220", locked)  # biggest first
         self.assertIn("usable now: WoodLog 96; stone blocks: none.", stuff)
+        # Wood is usable already, so only the Steel waits on allow_items.
+        self.assertIn("Forbidden building materials, offered in the orders all the same: Steel 480.", unlock)
 
     def test_says_nothing_when_there_is_nothing(self) -> None:
         usable, locked, stuff = describe_supplies([])

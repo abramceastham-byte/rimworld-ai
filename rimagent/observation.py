@@ -12,69 +12,84 @@ class Operations:
     lines: list[str] = field(default_factory=list)
     targets: dict[str, list[dict]] = field(default_factory=dict)
     storage: dict | None = None  # /resources/storages/summary, for hints.storage_hint
+    tagged: list[tuple[str, str]] = field(default_factory=list)  # (toolkit, line), for rimagent.modes
+
+    def add(self, tag: str, line: str) -> None:
+        """One observation line, tagged with the toolkit it belongs to."""
+        self.lines.append(line)
+        self.tagged.append((tag, line))
 
 
-def read_operations(client, colonists, defs, map_id=0):
+TARGET_TOOLKIT = {"mine": "wood_mining", "hunt": "hunting", "harvest": "farming"}
+
+
+def read_operations(client, colonists, defs, map_id=0, fields=None):
+    """fields: one description per growing zone ("Plant_Potato field (1,2)-(6,7),
+    30 cells"), which /map/zones can't give since it has no locations."""
     result = Operations()
 
     def get(path, **params):
         try:
             return client._request("GET", "/api/v1/" + path, params={"map_id": map_id, **params})
         except (RimApiError, httpx.HTTPError, ValueError) as e:
-            result.lines.append(f"Unavailable observation {path}: {str(e)[:120]}")
+            result.add("general", f"Unavailable observation {path}: {str(e)[:120]}")
             return None
 
     weather = get("map/weather")
     temperature = weather.get("temperature") if weather else None
     if weather:
         shown = f"{temperature:.0f}" if isinstance(temperature, (int, float)) else "?"
-        result.lines.append(f"Outdoors: {shown} C, {weather.get('weather', '?')}.")
+        result.add("general", f"Outdoors: {shown} C, {weather.get('weather', '?')}.")
     date = get("datetime")
     if date:
-        result.lines.append("Date: " + date.get("datetime", "unknown"))
+        result.add("general", "Date: " + date.get("datetime", "unknown"))
     farm = get("map/farm/summary")
     zones = (get("map/zones") or {}).get("zones") or []
     if isinstance(temperature, (int, float)):
-        result.lines.append(growing_season(temperature))
-    fields = [z for z in zones if "Growing" in (z.get("type") or "")]
+        result.add("farming", growing_season(temperature))
+    growing = [z for z in zones if "Growing" in (z.get("type") or "")]
     if colonists:
-        result.lines.append(field_advice(sum(z.get("cells_count", 0) for z in fields), len(colonists)))
+        result.add("farming", field_advice(sum(z.get("cells_count", 0) for z in growing), len(colonists),
+                                           fields if fields is not None else
+                                           [f"{z.get('label')}, {z.get('cells_count', 0)} cells" for z in growing]))
     if farm:
-        result.lines.append(f"Farms: {farm.get('total_growing_zones', 0)} growing zones, "
-                            f"{sum(z.get('cells_count', 0) for z in fields)} cells in all, "
+        result.add("farming", f"Farms: {farm.get('total_growing_zones', 0)} growing zones, "
+                            f"{sum(z.get('cells_count', 0) for z in growing)} cells in all, "
                             f"{farm.get('total_plants', 0)} plants, "
                             f"{farm.get('total_infected_plants', 0)} infected.")
         crops = [c["plant_def_name"] for c in farm.get("crop_types", [])]
         for crop in farm.get("crop_types", []):
             name = crop["plant_def_name"]
-            result.lines.append(describe_crop(crop, defs.plants.get(name, {})))
+            result.add("farming", describe_crop(crop, defs.plants.get(name, {})))
         # RIMAPI can't give a field's cells or its own growth (its per-zone
         # endpoint reads map_id as the zone id), so fields are found from
         # where each crop's plants stand.
-        for crop, area, count in fields_from_plants(client.get_plants(map_id), crops):
-            result.lines.append(f"Field of {crop} around {area}: {count} plants.")
+        plants = client.get_plants(map_id)
+        for crop, area, count in fields_from_plants(plants, crops):
+            result.add("farming", f"Field of {crop} around {area}: {count} plants.")
+        for crop in farm.get("crop_types", []):
             if crop.get("harvestable_plants", 0):
                 # Plant rows carry no growth, so these are the crop's cells;
                 # the harvest designation itself only takes ripe plants.
                 result.targets.setdefault("harvest", []).extend(
-                    {"name": name, "x": p["position"]["x"], "z": p["position"]["z"]}
-                    for p in client.get_plants(map_id) if p.get("def_name") == name)
+                    {"name": crop["plant_def_name"], "x": p["position"]["x"], "z": p["position"]["z"]}
+                    for p in plants if p.get("def_name") == crop["plant_def_name"])
     storage = get("resources/storages/summary")
     result.storage = storage
     if storage:
-        result.lines.append(describe_storage(storage, [z for z in zones if "Stockpile" in (z.get("type") or "")]))
+        result.add("storage", describe_storage(storage, [z for z in zones if "Stockpile" in (z.get("type") or "")]))
     power = get("map/power/info")
     if power:
         makers = len(power.get("produce_power_buildings") or [])
         users = len(power.get("consume_power_buildings") or [])
         if makers or users:
-            result.lines.append(
+            result.add("power",
                 f"Power: {makers} generators, {users} consumers; producing "
                 f"{power.get('current_power', 0):.0f} W for {power.get('total_consumption', 0):.0f} W "
                 f"demand; stored {power.get('currently_stored_power', 0):.0f}/"
                 f"{power.get('total_power_storage', 0):.0f} Wd (map totals, not proof a building is connected).")
         else:
-            result.lines.append("Power: no generators or powered buildings; electrical devices won't run.")
+            result.add("power", "Power: no generators or powered buildings; electrical devices won't run.")
     rooms = get("map/rooms")
     if rooms:
         for room in rooms.get("rooms", []):
@@ -82,10 +97,10 @@ def read_operations(client, colonists, defs, map_id=0):
             if not beds or room.get("is_doorway"):  # a door cell is its own "room"
                 continue
             if room.get("touches_map_edge"):  # the "room" RimWorld calls outdoors
-                result.lines.append(f"Beds outdoors, in no room: {beds}.")
+                result.add("shelter", f"Beds outdoors, in no room: {beds}.")
             else:
                 roof = room.get("open_roof_count") or 0
-                result.lines.append(
+                result.add("shelter",
                     f"Bedroom with beds {beds}: {room.get('cells_count')} cells, "
                     f"{room.get('temperature', 0):.0f} C"
                     + (f", {roof} cells unroofed" if roof else ", roofed") + ".")
@@ -93,7 +108,7 @@ def read_operations(client, colonists, defs, map_id=0):
     if windows:
         forced = [w["window_type"] for w in windows if w.get("force_pause")]
         if forced:
-            result.lines.append("Forced pause windows: " + ", ".join(forced))
+            result.add("general", "Forced pause windows: " + ", ".join(forced))
     ore = get("map/ore")
     if ore:
         width = ore.get("map_width", 0)
@@ -124,7 +139,7 @@ def read_operations(client, colonists, defs, map_id=0):
                     weapons = [t["def_name"] for t in inventory.get("equipment", [])]
                     hunters.append(f"{pawn.name} ({', '.join(weapons) or 'unarmed'})")
         if hunters:
-            result.lines.append("Hunters and their weapons: " + ", ".join(hunters)
+            result.add("hunting", "Hunters and their weapons: " + ", ".join(hunters)
                                 + ". Unarmed hunters won't hunt; hunted animals may fight back.")
     anchor = next((c.position for c in colonists if c.position), None)
     # Exact nearby candidates, not entire ore grids or all wild animals.
@@ -132,7 +147,7 @@ def read_operations(client, colonists, defs, map_id=0):
         targets.sort(key=lambda t: abs(t["x"] - anchor.x) + abs(t["z"] - anchor.z) if anchor else 0)
         shown = representative_targets(targets)
         if targets:
-            result.lines.append(f"Nearest {kind} targets: " + "; ".join(describe_target(kind, t)
+            result.add(TARGET_TOOLKIT.get(kind, "general"), f"Nearest {kind} targets: " + "; ".join(describe_target(kind, t)
                                                                       for t in shown) + ".")
     return result
 
@@ -144,14 +159,22 @@ PLENTY_OF_STORAGE = 0.5  # under this share used, another stockpile isn't needed
 FIELD_CELLS_PER_COLONIST = 10  # a recommendation shown to the model, never enforced
 
 
-def field_advice(field_cells: int, colonists: int) -> str:
-    """How much growing area there is against the recommended amount."""
+def field_advice(field_cells: int, colonists: int, fields: list[str] = ()) -> str:
+    """How much growing area there is against the recommended amount, naming
+    each field so the model can see its own fields meet the need."""
     target = FIELD_CELLS_PER_COLONIST * colonists
     text = (f"Recommended growing area: about {FIELD_CELLS_PER_COLONIST} cells per colonist, {target} for "
             f"{colonists}; you have {field_cells}")
+    if fields:
+        text += f" in {len(fields)} field{'s' if len(fields) > 1 else ''} ({'; '.join(fields)})"
     if field_cells < target:
-        return text + f", so a field of about {target - field_cells} more cells would help."
-    return text + ", which is enough; more fields are optional."
+        need = target - field_cells
+        return text + (f", so one field of about {need} more cells "
+                       "would help. Bigger isn't better: every cell must be sown and harvested by your few "
+                       f"colonists, which takes them from other work. Fields beyond {2 * target} cells in all "
+                       "are refused.")
+    return text + (", which is enough: a plan step to make a field is already done. Don't add fields until you "
+                   "have more colonists or food runs short; every extra cell is more sowing and harvesting.")
 
 
 def growing_season(temperature: float) -> str:
@@ -201,7 +224,7 @@ def describe_storage(storage: dict, stockpiles: list[dict]) -> str:
     text = f"Storage: {used}/{total} cells used" + (f" across {len(stockpiles)} stockpiles ({sizes})" if sizes else "")
     if total and used < PLENTY_OF_STORAGE * total:
         return text + (f". {total - used} cells free: plenty of room, so don't create another stockpile; "
-                       "for better storage, build a storage room with shelves.")
+                       "stop expanding storage and reassess the colony's needs.")
     return text + "."
 
 

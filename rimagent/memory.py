@@ -1,9 +1,11 @@
 """Persistent and working memory for the colony agent."""
 
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Literal
 
+from rimagent.finish import FinishCheck
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -24,6 +26,12 @@ class CurrentPlan(BaseModel):
     objective: str = Field(min_length=1, max_length=500)
     status: Literal["active", "completed", "blocked", "abandoned"] = "active"
     steps: list[PlanStep] = Field(default_factory=list, max_length=20)
+    # Set by the overview/focus loop (rimagent.modes); unused by the single-prompt loop.
+    toolkits: list[str] = Field(default_factory=list)
+    uses: str = ""       # what from the prompt the plan relies on
+    finish: list[FinishCheck] = Field(default_factory=list)  # measured each turn; all met ends the plan
+    done_when: str = ""
+    turns: int = 0
 
 
 class MemoryUpdate(BaseModel):
@@ -32,6 +40,7 @@ class MemoryUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     observation: str | None = Field(default=None, max_length=2000)
+    toolkit: str | None = None  # what the observation is about; shown only to that toolkit's turns
     replace_plan: CurrentPlan | None = None
     clear_plan: bool = False
     status_updates: dict[str, str] = Field(default_factory=dict)
@@ -69,6 +78,19 @@ def diary_like(observation: str) -> bool:
     """True when an observation reports this turn instead of stating a lasting lesson."""
     text = observation.strip().lower()
     return text.startswith(DIARY_OPENINGS) or bool(DIARY_DETAIL.search(observation))
+
+
+SAME_LESSON = 0.6  # text similarity at which two lessons say the same thing
+
+
+def same_lesson(a: str, b: str) -> bool:
+    """True when two lessons say the same thing in slightly different words.
+
+    One run saved "Young trees do not yield wood; mature trees must be selected
+    for chopping" and "...; selecting a new area with mature trees is
+    necessary" four times between them (similarity 0.65; unrelated lessons ~0.2).
+    """
+    return SequenceMatcher(None, a.casefold(), b.casefold()).ratio() >= SAME_LESSON
 
 
 def held_until_confirmed(plan: CurrentPlan, previous: CurrentPlan | None,
@@ -181,7 +203,7 @@ class AgentMemory:
         self.recent_decisions = self.recent_decisions[-self.max_recent_decisions :]
 
     def apply_update(
-        self, step: int, game_tick: int, update: MemoryUpdate | None
+        self, step: int, game_tick: int, update: MemoryUpdate | None, default_toolkit: str | None = None
     ) -> str | None:
         """Apply a model-proposed update to the Markdown and JSON stores.
 
@@ -198,10 +220,15 @@ class AgentMemory:
                     "(what you placed or planned, stock numbers, coordinates). Save lessons that stay true, "
                     "e.g. \"colonists prefer beds inside a room to beds outdoors\".")
             observation = ""
+        tag = update.toolkit or default_toolkit
+        if observation and any(same_lesson(observation, saved) for saved in self.observations_for({tag or "general"})):
+            note = "Lesson not saved: you already saved one that says the same."
+            observation = ""
         if observation:
             with self.observations_path.open("a", encoding="utf-8") as observations:
                 observations.write(
-                    f"\n## Step {step} (game tick {game_tick})\n\n{observation}\n"
+                    f"\n## Step {step} (game tick {game_tick})" + (f" [{tag}]" if tag else "")
+                    + f"\n\n{observation}\n"
                 )
 
         if update.clear_plan:
@@ -234,6 +261,26 @@ class AgentMemory:
 
         self._save_state()
         return note
+
+    def save_plan(self, plan: CurrentPlan) -> None:
+        """Store the modes loop's plan as it stands (no completion holding there)."""
+        self.state.current_plan = plan
+        self.state.unconfirmed = []
+        if not self.read_only:
+            self._save_state()
+
+    def observations_for(self, tags: set[str]) -> list[str]:
+        """Saved observations whose toolkit is in tags ("general" = untagged)."""
+        text = self.observations_path.read_text(encoding="utf-8") if self.observations_path.exists() else ""
+        found = []
+        for entry in text.split("\n## ")[1:]:
+            heading, _, body = entry.partition("\n")
+            tag = heading.rsplit("[", 1)[1].rstrip("] ") if heading.rstrip().endswith("]") else "general"
+            # Diary entries saved before diary_like existed stay on disk, not in prompts.
+            # Duplicates saved before same_lesson existed: show the latest wording once.
+            if tag in tags and body.strip() and not diary_like(body.strip()):
+                found = [f for f in found if not same_lesson(f, body.strip())] + [body.strip()]
+        return found
 
     def _observation_prompt(self) -> str:
         observations = self.observations_path.read_text(encoding="utf-8") if self.observations_path.exists() else ""

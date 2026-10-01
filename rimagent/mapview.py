@@ -12,6 +12,7 @@ are already checked to be clear, so it can pick a place instead of doing
 arithmetic on the grid.
 """
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -22,6 +23,7 @@ RICH_SOIL, SOIL, POOR_SOIL, BARE, WATER = "*", ".", ",", "_", "~"
 COLONIST, TREE, FORBIDDEN = "@", "T", "f"
 WALL, DOOR, BUILDING, FRAME, BLUEPRINT = "#", "+", "n", "F", "b"
 GROWING, STOCKPILE = "g", "s"
+AREA_MARKS = "123456789"  # reserved areas, numbered as in the site plan
 
 DETAIL_LEGEND = (
     f"  {RICH_SOIL} rich soil  {SOIL} soil  {POOR_SOIL} poor soil  "
@@ -35,7 +37,7 @@ OVERVIEW_LEGEND = (
     f"{RICH_SOIL} rich soil  {SOIL} open ground"
 )
 
-MAX_DETAIL_SPAN = 21   # cells across; bigger costs too many tokens
+MAX_DETAIL_SPAN = 31   # cells across; bigger costs too many tokens
 DETAIL_MARGIN = 3      # keep this much space around the base in view
 OVERVIEW_BLOCK = 5     # cells per overview character
 OVERVIEW_BLOCKS = 12   # overview is this many characters square
@@ -107,10 +109,16 @@ def ruler(view: Rect, label_width: int) -> str:
 
 
 def detail_rows(view: Rect, terrain, defs_terrain: dict[str, TerrainInfo],
-                marks: dict[tuple[int, int], str]) -> list[str]:
-    """The detail grid, north at the top, with a ruler above and z labels."""
+                marks: dict[tuple[int, int], str], areas: list[str] = ()) -> list[str]:
+    """The detail grid, north at the top, with a ruler above and z labels.
+
+    areas: purpose names, marked 1, 2, 3... on otherwise open cells."""
+    legend = [DETAIL_LEGEND]
+    if areas:
+        legend.append("  " + "  ".join(f"{AREA_MARKS[i]} {name} area" for i, name in enumerate(areas))
+                      + " (reserved, see the site plan)")
     rows = [f"Detail, one character per cell, x {view.x1}-{view.x2}, z {view.z2} (top) "
-            f"down to {view.z1}:", DETAIL_LEGEND, ruler(view, len("  z=123 "))]
+            f"down to {view.z1}:", *legend, ruler(view, len("  z=123 "))]
     for z in range(view.z2, view.z1 - 1, -1):
         row = "".join(
             marks.get((x, z)) or terrain_mark(defs_terrain.get(terrain.at(x, z)))
@@ -200,7 +208,7 @@ def free_spots(anchor: tuple[int, int], terrain, defs_terrain: dict[str, Terrain
                     info_at.pop(cell, None)
                 continue
         fertile = sum(1 for c in rect if info_at[c].fertility >= 0.7) / rect.cells
-        soil = ("fertile throughout, crops can grow" if fertile == 1 else
+        soil = ("fertile throughout" if fertile == 1 else
                 f"{fertile:.0%} fertile" if fertile >= 0.5 else "poor soil, no crops")
         steps = abs((rect.x1 + rect.x2) // 2 - cx) + abs((rect.z1 + rect.z2) // 2 - cz)
         found.append((chr(ord("A") + len(found)), rect,
@@ -242,3 +250,51 @@ def biggest_rect(free: set[tuple[int, int]], bounds: tuple[int, int, int, int],
                 if best_score is None or score > best_score:
                     best, best_score = rect, score
     return best
+
+
+def suggested_field(spots: list[tuple[str, Rect, str]], terrain, defs_terrain: dict[str, TerrainInfo],
+                    anchor: tuple[int, int], cells: int, min_fertility: float,
+                    avoid: list[Rect] = (), prefer: Rect | None = None, gap: int = 0) -> Rect | None:
+    """A ready-made field of about `cells` cells: all fertile enough, inside a
+    spot already checked clear, as close to the base as possible.
+
+    Models copy coordinates they are given. Offered only 15x15 open-ground
+    spots and a sentence saying "about 30 cells", they sowed the whole spot.
+
+    avoid: areas reserved for buildings; prefer: the fields area, used when a
+    field fits in it; gap: cells kept free around the base's middle. A field
+    offered right at the base's middle collided with the storage area the
+    model reserved there the same turn, and storage failed for ten turns.
+    """
+    if cells < 4:
+        return None
+    width = max(2, math.ceil(math.sqrt(cells)))
+    depth = max(2, math.ceil(cells / width))
+    cx, cz = anchor
+
+    def search(within: Rect | None) -> Rect | None:
+        best: tuple[int, Rect] | None = None
+        for _, spot, _ in spots:
+            for w, d in ((width, depth), (depth, width)):
+                if w > spot.x2 - spot.x1 + 1 or d > spot.z2 - spot.z1 + 1:
+                    continue
+                for x in range(spot.x1, spot.x2 - w + 2):
+                    for z in range(spot.z1, spot.z2 - d + 2):
+                        rect = Rect(x, z, x + w - 1, z + d - 1)
+                        steps = abs(x + w // 2 - cx) + abs(z + d // 2 - cz)
+                        if best is not None and steps >= best[0]:
+                            continue
+                        if within is not None and not (within.x1 <= rect.x1 and rect.x2 <= within.x2
+                                                       and within.z1 <= rect.z1 and rect.z2 <= within.z2):
+                            continue
+                        if gap and rect.x1 - gap <= cx <= rect.x2 + gap and rect.z1 - gap <= cz <= rect.z2 + gap:
+                            continue
+                        if any(a.x1 <= rect.x2 and rect.x1 <= a.x2 and a.z1 <= rect.z2 and rect.z1 <= a.z2
+                               for a in avoid):
+                            continue
+                        if all((info := defs_terrain.get(terrain.at(*c))) is not None
+                               and info.fertility >= min_fertility for c in rect):
+                            best = (steps, rect)
+        return best[1] if best else None
+
+    return (search(prefer) if prefer is not None else None) or search(None)

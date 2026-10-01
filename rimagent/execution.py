@@ -1,20 +1,97 @@
 """Execute one order, distinguish unchanged, verified and submitted outcomes."""
 
 import json
+from dataclasses import dataclass, field
 
 from rimagent.choices import action_target, incapable_work
 from rimagent.hints import ONE_AT_A_TIME
+from rimagent.construction import Rect
+from rimagent.finish import FOOD, is_food
+from rimagent.supplies import listed, stock_by_def
+from rimagent.power import CONDUITS
 from rimagent.rimapi import RimApiError
 
 
-def execute(client, action, blueprints, zones, operations, learned_incapable=None, chops=None, mines=None):
+PAWN_ORDERS = ("draft", "move", "attack", "equip", "tend", "bed_rest", "rescue")
+
+
+@dataclass
+class Combat:
+    """What pawn orders need that RIMAPI doesn't report: enemies on the map this
+    turn, and who the agent drafted (RIMAPI has no drafted flag)."""
+
+    enemies: dict = field(default_factory=dict)   # enemy id -> rimapi.Enemy
+    drafted: set = field(default_factory=set)     # colonist names
+
+
+def pawn_order(client, action, combat: Combat) -> str:
+    """Draft, move, attack, equip, tend, bed rest, rescue. These go straight to a
+    pawn as player orders; RIMAPI only says it accepted them."""
+    colonists = {c.name: c for c in client.get_colonists()}
+
+    def pawn(name: str):
+        if name not in colonists:
+            raise ValueError(f"no colonist named {name}")
+        return colonists[name]
+
+    kind = action.action
+    if kind == "draft":
+        who = pawn(action.colonist)
+        if action.drafted == (who.name in combat.drafted):
+            return f"unchanged: {who.name} is already {'drafted' if action.drafted else 'released'}"
+        client.set_drafted(who.id, action.drafted)
+        (combat.drafted.add if action.drafted else combat.drafted.discard)(who.name)
+        return (f"{who.name} drafted: they stop working and take only your orders (move, attack)" if action.drafted
+                else f"{who.name} released back to work")
+    if kind in ("move", "attack"):
+        who = pawn(action.colonist)
+        if who.name not in combat.drafted:
+            raise ValueError(f"{who.name} isn't drafted; draft them first")
+        if kind == "move":
+            client.order_job(who.id, "Goto", position=(action.x, action.z))
+            return f"{who.name} ordered to move to ({action.x},{action.z})"
+        enemy = combat.enemies.get(action.target)
+        if enemy is None:
+            raise ValueError(f"no enemy {action.target} on the map now")
+        ranged = any(i.is_ranged for i in client.get_equipment(who.id))
+        client.order_job(who.id, "AttackStatic" if ranged else "AttackMelee", target_thing_id=enemy.id)
+        return (f"{who.name} ordered to {'shoot' if ranged else 'melee'} {enemy.kind} {enemy.id} at "
+                f"({enemy.x},{enemy.z})" + ("" if ranged else "; unarmed or melee-armed, so they close in"))
+    if kind == "equip":
+        who = pawn(action.colonist)
+        item = next((i for i in client.get_items() if i.thing_id == action.item_id), None)
+        if item is None:
+            raise ValueError(f"no item {action.item_id} on the map")
+        note = ""
+        if item.is_forbidden:
+            client.allow_items(Rect(item.position.x, item.position.z, item.position.x, item.position.z))
+            note = " (it was forbidden; now allowed)"
+        client.equip(who.id, item.thing_id)
+        return f"{who.name} ordered to pick up {item.def_name} at ({item.position.x},{item.position.z}){note}"
+    if kind == "tend":
+        patient = pawn(action.patient)
+        doctor = pawn(action.doctor) if action.doctor else None
+        client.tend(patient.id, doctor.id if doctor else None)
+        return f"{doctor.name if doctor else 'a doctor'} ordered to tend {patient.name}"
+    if kind == "bed_rest":
+        patient = pawn(action.patient)
+        client.bed_rest(patient.id)
+        return f"{patient.name} ordered to rest in bed"
+    who, patient = pawn(action.colonist), pawn(action.patient)
+    client.order_job(who.id, "Rescue", target_thing_id=patient.id)
+    return f"{who.name} ordered to carry {patient.name} to a bed"
+
+
+def execute(client, action, blueprints, zones, operations, learned_incapable=None, chops=None, mines=None,
+            combat=None, layout=None):
     """Carry out one order against freshly read state, and say what it did.
 
     Returns "unchanged: ..." when the game already matches, or what was
     verified or merely submitted. Raises ValueError/RimApiError on failure.
     learned_incapable collects work RIMAPI refused, for later turns' choices;
     chops (a ChopTracker) remembers which trees were ordered cut, mines (a
-    MineTracker) which rock was marked for mining.
+    MineTracker) which rock was marked for mining. combat (a Combat) holds this
+    turn's enemies and who is drafted; layout (a LayoutTracker) the reserved areas.
     Does not advance the game clock.
     """
     client.begin_snapshot()
@@ -81,25 +158,38 @@ def execute(client, action, blueprints, zones, operations, learned_incapable=Non
                 return f"unchanged: {target}, zone {z.zone_id} already exists (crop edits are not observable reliably)"
         if kind == "create_growing_zone":
             zone_id = client.create_growing_zone(action.plant, rect)
-            zones.add("growing", zone_id, f"{action.plant} field", rect)
         else:
             zone_id = client.create_stockpile(rect)
-            zones.add("stockpile", zone_id, "stockpile", rect)
         actual = next((z for z in client.get_zones() if z.id == zone_id), None)
-        if actual is None or actual.cells_count != rect.cells:
-            raise ValueError(f"zone {zone_id} creation incomplete: expected {rect.cells} cells; "
-                             f"observed {actual.cells_count if actual else 'missing'}; refresh before retry")
-        detail = f"verified zone {zone_id}, {rect.cells} cells; crop/geometry recorded locally"
+        if actual is None or not actual.cells_count:
+            raise ValueError(f"zone {zone_id} was not created: the game shows no cells for it")
+        # RimWorld leaves out cells under shelves and other buildings; the
+        # zone still exists, so it is recorded, not reported as a failure.
+        if kind == "create_growing_zone":
+            zones.add("growing", zone_id, f"{action.plant} field", rect, actual.cells_count)
+        else:
+            zones.add("stockpile", zone_id, "stockpile", rect, actual.cells_count)
+        detail = f"verified zone {zone_id}, {actual.cells_count} cells; crop/geometry recorded locally"
+        if actual.cells_count != rect.cells:
+            detail += (f" (the game left out {rect.cells - actual.cells_count} of the {rect.cells} cells, those "
+                       "under buildings or already zoned; nothing more to do)")
+    elif kind == "plan_area":
+        if layout is None:
+            raise ValueError("no layout plan is kept in this loop")
+        return target + ": " + layout.plan(action.purpose, action.rect())
+    elif kind in PAWN_ORDERS:
+        return target + ": " + pawn_order(client, action, combat or Combat())
     elif kind == "allow_items":
-        rect = action.rect()
-        before = [t for t in client.get_items() if t.is_forbidden and rect.contains(t.position.x, t.position.z)]
+        wanted = action.what
+        before = [t for t in client.get_items() if t.is_forbidden and (
+            wanted == "all" or (is_food(t.def_name) if wanted == FOOD else t.def_name == wanted))]
         if not before:
-            return f"unchanged: {target}, no forbidden items remain"
-        count = client.allow_items(rect)
+            return f"unchanged: {target}, nothing {'' if wanted == 'all' else wanted + ' '}is forbidden"
+        count = client.allow_things([t.thing_id for t in before])
         remaining = [t for t in client.get_items() if t.is_forbidden and t.thing_id in {i.thing_id for i in before}]
         if remaining:
             raise ValueError(f"allow_items partially applied: {len(remaining)}/{len(before)} still forbidden")
-        detail = f"verified {count} stacks allowed"
+        detail = f"verified {count} stacks allowed, now usable: {listed(stock_by_def(before, True))}"
     elif kind == "chop_trees":
         rect = action.rect()
         tick = client.get_state().game_tick
@@ -154,6 +244,12 @@ def execute(client, action, blueprints, zones, operations, learned_incapable=Non
             "build_wall": lambda: client.build_wall(action.rect(), action.stuff),
             "build_floor": lambda: client.build_floor(action.rect(), action.terrain),
             "build_room": lambda: client.build_room(action.rect(), action.stuff, action.door_side),
+            "connect_power": lambda: client.connect_power(
+                (action.from_x, action.from_z), (action.to_x, action.to_z),
+                planned={c for bp in (blueprints.items if blueprints else []) if bp.def_name not in CONDUITS
+                         for c in bp.area()},
+                planned_conduits={(bp.x, bp.z) for bp in (blueprints.items if blueprints else [])
+                                  if bp.def_name in CONDUITS}),
         }
         if kind not in methods:
             raise ValueError(f"unsupported action: {kind}")

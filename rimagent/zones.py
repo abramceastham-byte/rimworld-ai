@@ -26,12 +26,18 @@ class TrackedZone(BaseModel):
     zone_id: int
     label: str            # e.g. "Plant_Potato field" or "stockpile"
     cells: tuple[int, int, int, int]
+    # Cells the game actually gave it, when fewer than the rectangle: RimWorld
+    # leaves out cells under shelves and other buildings.
+    size: int | None = None
 
     def area(self) -> Rect:
         return Rect(*self.cells)
 
+    def cell_count(self) -> int:
+        return self.size if self.size is not None else self.area().cells
+
     def describe(self) -> str:
-        return f"{self.label} {self.area()}"
+        return f"{self.label} {self.area()}, {self.cell_count()} cells"
 
 
 class ZoneTracker:
@@ -47,9 +53,10 @@ class ZoneTracker:
         self.path.write_text(json.dumps([z.model_dump() for z in self.items], indent=2),
                              encoding="utf-8")
 
-    def add(self, kind: ZoneKind, zone_id: int, label: str, area: Rect) -> None:
+    def add(self, kind: ZoneKind, zone_id: int, label: str, area: Rect, size: int | None = None) -> None:
         self.items.append(TrackedZone(kind=kind, zone_id=zone_id, label=label,
-                                      cells=(area.x1, area.z1, area.x2, area.z2)))
+                                      cells=(area.x1, area.z1, area.x2, area.z2),
+                                      size=size if size is not None and size != area.cells else None))
         self.save()
 
     def cells(self) -> set[tuple[int, int]]:

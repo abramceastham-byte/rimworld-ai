@@ -13,6 +13,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 from rimagent.construction import Rect
+from rimagent.layout import AreaPurpose
 from rimagent.memory import MemoryUpdate
 
 MAX_ACTIONS = 10
@@ -75,8 +76,16 @@ class Designate(RectAction):
     designation: Literal["mine", "harvest", "hunt"]
 
 
-class AllowItems(RectAction):
+class AllowItems(BaseAction):
+    """Allow forbidden items anywhere on the map: all of them, all food, or one def.
+
+    It took a rectangle, and a model spent four turns allowing one scattered
+    pile at a time (64 logs on one cell, 4 meals 60 cells out) while nobody
+    had work. Walking near the dormant mechanoids doesn't wake them.
+    """
+
     action: Literal["allow_items"]
+    what: str = "all"  # "all", "Food" (meals and raw food), or an item def name
 
 
 class ChopTrees(RectAction):
@@ -106,6 +115,73 @@ class BuildRoom(RectAction):
     purpose: Literal["bedroom", "barracks", "kitchen", "dining", "workshop", "storage", "hospital", "other"]
 
 
+class ConnectPower(BaseAction):
+    """Link two buildings with conduits; code chooses the route (see rimagent.power)."""
+
+    action: Literal["connect_power"]
+    from_x: int = Field(ge=0)  # any cell of the power source (generator, battery) or its grid
+    from_z: int = Field(ge=0)
+    to_x: int = Field(ge=0)    # any cell of what needs power (lamp, stove, ...)
+    to_z: int = Field(ge=0)
+
+
+class PlanArea(RectAction):
+    """Reserve where a kind of building goes (see rimagent.layout). Builds nothing."""
+
+    action: Literal["plan_area"]
+    purpose: AreaPurpose
+
+
+class Draft(BaseAction):
+    action: Literal["draft"]
+    colonist: str
+    drafted: bool  # true to draft for combat, false to release back to work
+
+
+class Move(BaseAction):
+    """Send a drafted colonist to a cell."""
+
+    action: Literal["move"]
+    colonist: str
+    x: int = Field(ge=0)
+    z: int = Field(ge=0)
+
+
+class Attack(BaseAction):
+    """A drafted colonist attacks one enemy: shoots with a gun, else melee."""
+
+    action: Literal["attack"]
+    colonist: str
+    target: int  # enemy id from the threat list
+
+
+class Equip(BaseAction):
+    """Pick up a weapon (or put on apparel) lying on the map."""
+
+    action: Literal["equip"]
+    colonist: str
+    item_id: int
+
+
+class Tend(BaseAction):
+    action: Literal["tend"]
+    patient: str
+    doctor: str | None = None  # None: any capable doctor
+
+
+class BedRest(BaseAction):
+    action: Literal["bed_rest"]
+    patient: str
+
+
+class Rescue(BaseAction):
+    """Carry a downed colonist to a bed."""
+
+    action: Literal["rescue"]
+    colonist: str
+    patient: str
+
+
 class SetResearch(BaseAction):
     action: Literal["set_research"]
     project: str  # def name from the available list, e.g. "Brewing"
@@ -126,6 +202,7 @@ Action = Annotated[
         CreateGrowingZone, CreateStockpile, PlaceBlueprint, Designate,
         BuildWall, BuildFloor, BuildRoom,
         AllowItems, ChopTrees,
+        ConnectPower, PlanArea, Draft, Move, Attack, Equip, Tend, BedRest, Rescue,
     ],
     Field(discriminator="action"),
 ]

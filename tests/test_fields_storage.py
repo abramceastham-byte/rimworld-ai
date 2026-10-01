@@ -48,12 +48,20 @@ class FieldTests(unittest.TestCase):
 class FieldAdviceTests(unittest.TestCase):
     def test_short_of_the_recommendation_says_how_much_more(self) -> None:
         from rimagent.observation import field_advice
-        self.assertEqual(field_advice(12, 3), "Recommended growing area: about 10 cells per colonist, 30 for 3; "
-                                              "you have 12, so a field of about 18 more cells would help.")
+        text = field_advice(12, 3)
+        self.assertIn("30 for 3; you have 12, so one field of about 18 more cells would help", text)
+        self.assertIn("Bigger isn't better", text)
 
     def test_enough_is_only_advice(self) -> None:
         from rimagent.observation import field_advice
-        self.assertIn("you have 302, which is enough; more fields are optional.", field_advice(302, 3))
+        self.assertIn("you have 302, which is enough", field_advice(302, 3))
+
+    def test_names_each_field(self) -> None:
+        from rimagent.observation import field_advice
+        text = field_advice(60, 3, ["Plant_Potato field (115,136)-(120,140), 30 cells",
+                                    "Plant_Potato field (108,145)-(112,150), 30 cells"])
+        self.assertIn("you have 60 in 2 fields (Plant_Potato field (115,136)-(120,140), 30 cells; "
+                      "Plant_Potato field (108,145)-(112,150), 30 cells), which is enough", text)
 
 
 class StorageTests(unittest.TestCase):
@@ -82,7 +90,7 @@ class StockpileGuardTests(unittest.TestCase):
         refusal = stockpile_refusal(stockpile(30, 30, 34, 34), self.facts(used=10))
         self.assertIn("plenty of room (10/400 cells used)", refusal)
         hint, keep = failure_hint(stockpile(30, 30, 34, 34), refusal, self.facts(used=10))
-        self.assertIn("build_room with purpose storage, place Shelf blueprints inside", hint)
+        self.assertIn("Stop expanding storage", hint)
         self.assertFalse(keep)
 
     def test_always_allowed_inside_a_storage_room(self) -> None:
@@ -97,3 +105,23 @@ class StockpileGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HousingAdviceTests(unittest.TestCase):
+    def test_no_bedrooms_says_what_is_needed(self) -> None:
+        from rimagent.rooms import housing_advice
+        text = housing_advice(3, [], [])
+        self.assertIn("3 beds and 36 cells for 3", text)
+        self.assertIn("You have beds for 0 and 0 cells inside 0 bedrooms; still needed: 3 more beds and about "
+                      "36 more cells of bedroom.", text)
+
+    def test_counts_beds_and_bedroom_space(self) -> None:
+        from rimagent.construction import Rect
+        from rimagent.rooms import TrackedRoom, housing_advice
+        rooms = [TrackedRoom(purpose="barracks", door_side="north", cells=(0, 0, 7, 7)),   # 6x6 inside
+                 TrackedRoom(purpose="storage", door_side="north", cells=(10, 0, 14, 4))]
+        beds = [("Bed", Rect(1, 1, 1, 2), "built"), ("DoubleBed", Rect(3, 1, 4, 2), "planned"),
+                ("Shelf", Rect(11, 1, 12, 1), "built")]
+        text = housing_advice(3, rooms, beds)
+        self.assertIn("You have beds for 1 (+2 planned) and 36 cells inside 1 bedroom "
+                      "(barracks (0,0)-(7,7), 36 cells inside), which is enough", text)

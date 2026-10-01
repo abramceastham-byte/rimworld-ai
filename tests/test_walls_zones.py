@@ -94,7 +94,7 @@ class ZoneTrackerTests(unittest.TestCase):
 
         reloaded = ZoneTracker(path)  # survives a restart, unlike RIMAPI's own listing
         self.assertEqual([z.describe() for z in reloaded.items],
-                         ["Plant_Potato field (117,121)-(119,123)", "stockpile (121,122)-(123,124)"])
+                         ["Plant_Potato field (117,121)-(119,123), 9 cells", "stockpile (121,122)-(123,124), 9 cells"])
         self.assertIn((118, 122), reloaded.cells())
         self.assertNotIn((130, 130), reloaded.cells())
 

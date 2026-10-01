@@ -30,6 +30,7 @@ from rimagent.construction import (
     is_tree,
     room_layout,
 )
+from rimagent.power import CONDUITS, route
 
 # Values accepted by POST /api/v1/game/speed
 PAUSED, NORMAL, FAST, SUPERFAST = 0, 1, 2, 3
@@ -147,6 +148,27 @@ class MapThing(BaseModel):
     is_forbidden: bool = False
     rotation: int = 0
     stuff_def_name: str | None = None
+    categories: list[str] = []  # e.g. ["WeaponsRanged"], ["WeaponsMelee"], ["Apparel"]
+
+    @property
+    def is_weapon(self) -> bool:
+        return any(c.startswith("Weapons") for c in self.categories)
+
+    @property
+    def is_ranged(self) -> bool:
+        return "WeaponsRanged" in self.categories
+
+
+class Enemy(BaseModel):
+    """One hostile pawn: its group from /lords, its place and health from /map/pawns."""
+
+    id: int
+    kind: str            # e.g. "Mech_Militor"
+    x: int
+    z: int
+    health: float = 1.0
+    group: str = ""      # faction name
+    active: bool = True  # False while its group sleeps
 
 
 class Building(BaseModel):
@@ -265,6 +287,33 @@ THREAT_BEHAVIOURS = {
 }
 
 
+# What a non-hostile group on the map is doing (RimWorld's lord jobs).
+VISITOR_BEHAVIOURS = {
+    "LordJob_VisitColony": "visiting: they wander the base for a while, then leave on their own",
+    "LordJob_TradeWithColony": "a trade caravan: they wait at the base to trade, then leave",
+    "LordJob_TravelAndExit": "passing through the map",
+    "LordJob_ExitMapBest": "leaving the map",
+    "LordJob_DefendPoint": "guarding a spot",
+    "LordJob_AssistColony": "here to help the colony",
+}
+
+
+class Visitors(BaseModel):
+    """A group on the map from a faction that isn't hostile."""
+
+    faction_name: str
+    relation: str          # "Neutral" or "Ally"
+    behaviour: str
+    names: list[str] = []
+    count: int = 0
+
+    def summary(self) -> str:
+        who = ", ".join(n for n in self.names if n and n != "Unknown") or f"{self.count} people"
+        what = VISITOR_BEHAVIOURS.get(self.behaviour, self.behaviour)
+        return (f"{self.count} from {self.faction_name} ({self.relation.lower()}): {who}; {what}. "
+                "Not a threat: don't draft against them or attack them, or their faction turns hostile.")
+
+
 class Threat(BaseModel):
     """A group on the map belonging to a hostile faction (raid, mech cluster, ...)."""
 
@@ -274,6 +323,8 @@ class Threat(BaseModel):
     current_step: str      # e.g. LordToil_Sleep for a dormant mech cluster
     pawn_count: int
     active: bool           # False while e.g. a mech cluster is still asleep
+    pawn_ids: list[int] = []  # thing ids of its pawns, from the lord's owned_pawn_ids
+    pawn_kinds: dict[int, str] = {}
 
     def summary(self) -> str:
         """One line for a prompt, clearly separating live threats from dormant ones."""
@@ -323,6 +374,18 @@ def _corners(rect: Rect) -> dict[str, dict[str, int]]:
         "point_a": {"x": rect.x1, "y": 0, "z": rect.z1},
         "point_b": {"x": rect.x2, "y": 0, "z": rect.z2},
     }
+
+
+def pawn_refs(owned: list[str]) -> dict:
+    """RIMAPI names a lord's pawns by ThingID, def name then id: "Mech_Militor3824"."""
+    ids, kinds = [], {}
+    for ref in owned:
+        digits = len(ref) - len(ref.rstrip("0123456789"))
+        if digits:
+            pid = int(ref[-digits:])
+            ids.append(pid)
+            kinds[pid] = ref[:-digits]
+    return {"pawn_ids": ids, "pawn_kinds": kinds}
 
 
 def _check_rect(rect: Rect, terrain: TerrainMap, max_cells: int | None = None) -> None:
@@ -445,8 +508,92 @@ class RimApiClient:
                 current_step=lord["current_toil_name"],
                 pawn_count=len(lord.get("owned_pawn_ids") or []),
                 active=lord.get("any_active_pawn", True),
+                **pawn_refs(lord.get("owned_pawn_ids") or []),
             ))
         return threats
+
+    def get_visitors(self, map_id: int = 0) -> list["Visitors"]:
+        """Groups on the map from factions that aren't hostile: visitors, traders,
+        travellers. Names come from /map/pawns, matched by id."""
+        friendly = {(f["name"], f["def_name"]): f.get("relation") or "?"
+                    for f in self._request("GET", "/api/v1/factions")
+                    if f.get("relation") != "Hostile" and f.get("def_name") != "PlayerColony"}
+        lords = [lord for lord in self._request("GET", "/api/v1/lords", params={"map_id": map_id})
+                 if (lord["faction_name"], lord["faction_def_name"]) in friendly]
+        if not lords:
+            return []
+        names = {p["id"]: p.get("name") or "?" for p in
+                 self._request("GET", "/api/v1/map/pawns", params={"map_id": map_id}) or []}
+        groups = []
+        for lord in lords:
+            ids = pawn_refs(lord.get("owned_pawn_ids") or [])["pawn_ids"]
+            groups.append(Visitors(faction_name=lord["faction_name"],
+                                   relation=friendly[(lord["faction_name"], lord["faction_def_name"])],
+                                   behaviour=lord["lord_job_type"],
+                                   names=[names[i] for i in ids if i in names],
+                                   count=len(ids)))
+        return groups
+
+    def get_enemies(self, threats: list[Threat] | None = None, map_id: int = 0) -> list[Enemy]:
+        """Hostile pawns on the map with positions. /map/pawns has no faction, so
+        hostiles are the pawns the hostile lords own, matched by id."""
+        threats = self.get_threats(map_id) if threats is None else threats
+        pawns = {p["id"]: p for p in self._request("GET", "/api/v1/map/pawns", params={"map_id": map_id}) or []}
+        enemies = []
+        for threat in threats:
+            for pid in threat.pawn_ids:
+                pawn = pawns.get(pid)
+                if not pawn or not pawn.get("position"):
+                    continue  # gone, dead or off the map
+                enemies.append(Enemy(id=pid, kind=threat.pawn_kinds.get(pid, "?"), x=pawn["position"]["x"],
+                                     z=pawn["position"]["z"], health=pawn.get("health", 1.0),
+                                     group=threat.faction_name, active=threat.active))
+        return enemies
+
+    def get_equipment(self, pawn_id: int) -> list[MapThing]:
+        """What a colonist holds (weapons); empty if unknown."""
+        data = self._request("GET", "/api/v1/pawns/inventory", params={"id": pawn_id}) or {}
+        return [MapThing.model_validate(t) for t in data.get("equipment", [])]
+
+    # --- Orders to pawns (combat, medical). Each is a player order, like a right-click. ---
+
+    def set_drafted(self, pawn_id: int, drafted: bool) -> None:
+        """Draft or release a colonist. RIMAPI's /pawn/edit/status can also kill or
+        resurrect a pawn; only is_drafted is ever sent."""
+        self._request("POST", "/api/v1/pawn/edit/status", json={"pawn_id": pawn_id, "is_drafted": drafted})
+
+    def order_job(self, pawn_id: int, job_def: str, target_thing_id: int | None = None,
+                  position: tuple[int, int] | None = None) -> None:
+        """Give a pawn one job (Goto, AttackStatic, AttackMelee, Rescue, ...), as the player would."""
+        body: dict = {"pawn_id": pawn_id, "job_def": job_def}
+        if target_thing_id is not None:
+            body["target_thing_id"] = target_thing_id
+        if position is not None:
+            body["target_position"] = {"x": position[0], "y": 0, "z": position[1]}
+        self._request("POST", "/api/v1/pawn/job", json=body)
+
+    def equip(self, pawn_id: int, item_id: int, apparel: bool = False) -> None:
+        """Pick up and equip a weapon (or put on apparel), as an ordered job.
+
+        Not /jobs/make/equip: RIMAPI 1.10 runs its apparel check on every item,
+        which throws for a weapon ("Failed to determine equip job"), so it can
+        never equip one. /pawn/job with RimWorld's Equip (or Wear) job works.
+        """
+        self.order_job(pawn_id, "Wear" if apparel else "Equip", target_thing_id=item_id)
+
+    def tend(self, patient_id: int, doctor_id: int | None = None) -> None:
+        """Have a doctor (or any capable colonist, if none is given) tend a patient."""
+        body: dict = {"patient_pawn_id": patient_id}
+        if doctor_id is not None:
+            body["doctor_pawn_id"] = doctor_id
+        self._request("POST", "/api/v1/pawn/medical/tend", json=body)
+
+    def bed_rest(self, patient_id: int, bed_id: int | None = None) -> None:
+        """Send a patient to rest in a bed (their own if none is given)."""
+        body: dict = {"patient_pawn_id": patient_id}
+        if bed_id is not None:
+            body["bed_building_id"] = bed_id
+        self._request("POST", "/api/v1/pawn/medical/bed-rest", json=body)
 
     def get_work_tables(self, map_id: int = 0) -> list[WorkTable]:
         """Work tables, their available recipes, and their current bills."""
@@ -982,6 +1129,59 @@ class RimApiClient:
         return (f"room {rect} with a {door_side} door: {walls} walls and {doors} door planned, "
                 f"needing {cost} {stuff}{kept}; not roofed or floored yet")
 
+    def connect_power(self, source: tuple[int, int], target: tuple[int, int],
+                      planned: set[tuple[int, int]] = frozenset(),
+                      planned_conduits: set[tuple[int, int]] = frozenset(), map_id: int = 0) -> str:
+        """Lay conduits between two buildings along the cheapest route (see rimagent.power).
+
+        source/target: any cell of the two buildings, built, being built or
+        planned. planned: cells of the agent's unbuilt blueprints (a conduit
+        can go under those too); planned_conduits: its unbuilt conduit
+        blueprints, reused like built ones.
+        """
+        buildings = self.get_buildings(map_id)
+        terrain = self.get_terrain(map_id)
+
+        def footprint_of(cell: tuple[int, int]) -> tuple[set[tuple[int, int]], str]:
+            for b in buildings:
+                if b.area().contains(*cell):
+                    return set(b.area()), b.def_name.removeprefix("Frame_")
+            for thing in self.get_things_at(*cell, map_id):
+                if thing.def_name.startswith("Blueprint_"):
+                    return {cell}, thing.def_name.removeprefix("Blueprint_")
+            raise ValueError(f"nothing to connect at {cell}: give a cell of a generator, battery or powered building")
+
+        src, src_name = footprint_of(source)
+        dst, dst_name = footprint_of(target)
+        cells = src | dst
+        bounds = Rect(max(0, min(x for x, _ in cells) - 8), max(0, min(z for _, z in cells) - 8),
+                      min(terrain.width - 1, max(x for x, _ in cells) + 8),
+                      min(terrain.height - 1, max(z for _, z in cells) + 8))
+        conduits = {c for b in buildings if b.def_name.removeprefix("Frame_") in CONDUITS for c in b.area()}
+        conduits |= set(planned_conduits)
+        covered = {c for b in buildings if b.def_name.removeprefix("Frame_") not in CONDUITS for c in b.area()}
+        covered |= set(planned) - conduits
+        check = self.check_area(bounds, map_id)
+        blocked = {(i.x, i.z) for i in check.terrain + check.ores}
+        path = route(src, dst, bounds, conduits, covered, lambda x, z: (x, z) in blocked)
+        if path is None:
+            raise ValueError(f"no conduit route from the {src_name} to the {dst_name}: rock or water is in the way")
+        if not path:
+            return f"unchanged: the {dst_name} is already within reach of the {src_name}'s conduits"
+        self.submitted_blueprints = [dict(def_name=name, stuff=None, x=x, z=z, rotation=0, area=Rect(x, z, x, z))
+                                     for x, z, name in path]
+        self._request("POST", "/api/v1/builder/blueprint", json={
+            "map_id": map_id, "position": {"x": bounds.x1, "y": 0, "z": bounds.z1},
+            "blueprint": {"width": bounds.x2 - bounds.x1 + 1, "height": bounds.z2 - bounds.z1 + 1, "floors": [],
+                          "buildings": [{"def_name": name, "stuff_def_name": None, "rel_x": x - bounds.x1,
+                                         "rel_z": z - bounds.z1, "rotation": 0} for x, z, name in path]},
+            "clear_obstacles": False,
+        })
+        under = sum(1 for _, _, name in path if name == "PowerConduit")
+        hidden = len(path) - under
+        return (f"{len(path)} conduits planned from the {src_name} to the {dst_name}: {under} under walls or "
+                f"buildings, {hidden} hidden in open ground; needs {under + 2 * hidden} Steel")
+
     def build_floor(self, rect: Rect, terrain: str, map_id: int = 0) -> str:
         """Blueprint flooring over a rectangle, skipping cells that are taken."""
         floor = FLOORS.get(terrain)
@@ -1007,7 +1207,11 @@ class RimApiClient:
                     blocked[(x, z)] = "floor already planned"
         free = [cell for cell in rect if cell not in blocked]
         if not free and all(ground.at(x, z) == terrain or self.construction_at(terrain, x, z, map_id=map_id) for x, z in rect):
-            return f"unchanged: {terrain} already laid or queued over {rect}"
+            laid = sum(1 for x, z in rect if ground.at(x, z) == terrain)
+            if laid == rect.cells:
+                return f"unchanged: {terrain} is already laid on all {laid} cells of {rect}: the floor is done"
+            return (f"unchanged: {terrain} over {rect}: {laid} of {rect.cells} cells laid, the rest queued and "
+                    "waiting for builders")
         if not free:
             raise ValueError(f"no cell in {rect} can take a floor: {AreaCheck.describe_cells(blocked)}")
         self.submitted_blueprints = [dict(def_name=terrain, stuff=None, x=x, z=z,
@@ -1109,12 +1313,16 @@ class RimApiClient:
         ]
         if not ids:
             raise ValueError(f"there are no forbidden items in {rect}")
+        return self.allow_things(ids, map_id)
+
+    def allow_things(self, thing_ids: list[int], map_id: int = 0) -> int:
+        """Unforbid these items; returns how many."""
         self._request(
             "POST",
             "/api/v1/things/set-forbidden",
-            json={"map_id": map_id, "thing_ids": ids, "forbidden": False},
+            json={"map_id": map_id, "thing_ids": list(thing_ids), "forbidden": False},
         )
-        return len(ids)
+        return len(thing_ids)
 
     def chop_trees(self, rect: Rect, map_id: int = 0,
                    skip: set[int] | frozenset[int] = frozenset()) -> tuple[list[MapThing], int]:

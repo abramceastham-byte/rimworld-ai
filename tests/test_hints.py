@@ -297,8 +297,8 @@ class StorageHintTests(unittest.TestCase):
         from rimagent.hints import storage_hint
         hint = storage_hint({"total_stockpiles": 2, "total_cells": 47, "used_cells": 47}, shelf_buildable=True)
         self.assertTrue(hint.startswith("HINT: Storage is full (47/47 cells used in 2 stockpiles)"))
-        self.assertIn("Best: a storage room (build_room purpose storage)", hint)
-        self.assertIn("place_blueprint Shelf (2x1) inside it", hint)
+        self.assertIn("Prefer furnishing a suitable existing storage room", hint)
+        self.assertIn("Shelf (2x1) stores several stacks per cell", hint)
         self.assertIn("A stockpile on open ground works too", hint)
 
     def test_nearly_full_counts_and_shelves_may_need_research(self) -> None:

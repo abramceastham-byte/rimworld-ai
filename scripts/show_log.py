@@ -38,6 +38,12 @@ TARGET_FIELDS = [
     ("position", "Position"),
     ("stuff", "Material"),
     ("rect", "Area"),
+    ("purpose", "Purpose"),
+    ("drafted", "Drafted"),
+    ("target", "Enemy"),
+    ("item_id", "Item"),
+    ("patient", "Patient"),
+    ("doctor", "Doctor"),
 ]
 MAP_ACTIONS = {"place_blueprint"}  # rotation only matters for these
 
@@ -105,14 +111,20 @@ def run_to_markdown(path: Path) -> str:
     if records:
         out.append(f"**Time:** {records[0]['time'][:19]} to {records[-1]['time'][:19]} (UTC)")
     counts = Counter(d["action"] for d in decisions)
+    # Older logs marked a fallback in the decision's reason; newer ones log a fallback_* failure.
+    fallbacks = (sum(1 for d in decisions if str(d.get("reason", "")).startswith("model failed"))
+                 + sum(1 for f in failures if str(f.get("failure_type", "")).startswith("fallback")))
     out += [
         f"**Decisions:** {len(decisions)} "
         f"({', '.join(f'{a} x{n}' for a, n in counts.most_common())})",
         f"**Failed actions:** {sum(1 for d in decisions if d.get('error'))} · "
         f"**Invalid or failed model replies:** {len(failures)} · "
-        f"**Fallbacks:** {sum(1 for d in decisions if str(d.get('reason', '')).startswith('model failed'))}",
+        f"**Fallbacks:** {fallbacks}",
         "",
     ]
+    kinds = Counter(d["prompt_kind"] for d in decisions if d.get("prompt_kind"))
+    if kinds:
+        out += ["**Prompts:** " + ", ".join(f"{k} x{n}" for k, n in kinds.most_common()), ""]
     seconds = [d["model_stats"]["seconds"] for d in decisions if d.get("model_stats")]
     if seconds:
         out += [f"**Model time per decision:** average {sum(seconds) / len(seconds):.1f}s, "
@@ -149,7 +161,9 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
     outcome = "FAILED" if error else "ok"
     index, total = d.get("action_index"), d.get("actions_in_turn") or 1
     number = f"{d.get('step', '?')}" if total == 1 or index is None else f"{d.get('step', '?')}.{index}"
-    out = [f"## Step {number}: {d['action']} ({outcome})", ""]
+    kind = d.get("prompt_kind")
+    tag = f" [{kind}]" if kind in ("focus", "threat", "overview") else ""
+    out = [f"## Step {number}{tag}: {d['action']} ({outcome})", ""]
     if state and (index in (None, 0)):
         mode = d.get("time_mode")
         if mode:
@@ -171,6 +185,7 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
         out += [f"- {e.get('kind')} ({e.get('category')}): {e.get('text')}" for e in events]
         out.append("")
     out += [f"**Reason:** {d.get('reason') or '(none given)'}", ""]
+    out += describe_plan(d.get("plan"))
     if d.get("time"):
         out += [f"**Time choice:** {d['time']}", ""]
     targets = describe_targets(d)
@@ -178,6 +193,14 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
         out += targets + [""]
     out += [f"**Result:** {'FAILED: ' + error if error else d.get('result', 'done')}", ""]
     out += describe_memory(d.get("memory_update"))
+    if d.get("plan_status"):
+        out.append(f"**Plan:** {d['plan_status']}"
+                   + (f"; asked for toolkits {', '.join(d['request_toolkits'])}" if d.get("request_toolkits") else ""))
+        out.append("")
+    lesson = d.get("lesson")
+    if lesson:
+        text, tag = (lesson.get("text"), lesson.get("toolkit")) if isinstance(lesson, dict) else (lesson, "combat")
+        out += [f"**Lesson saved** ({tag}): {text}", ""]
     for f in failures:
         out.append(f"**Attempt {f.get('attempt')} rejected** ({f.get('failure_type')}): `{f.get('error')}`")
         if f.get("response"):
@@ -195,18 +218,41 @@ def step_to_markdown(d: dict, state: dict | None, events: list, failures: list) 
     return out
 
 
+def describe_plan(plan: dict | None) -> list[str]:
+    """An overview's plan (modes loop), as Markdown lines."""
+    if not plan:
+        return []
+    out = [f"**Plan:** {plan.get('objective')}  ", f"**Toolkits:** {', '.join(plan.get('toolkits') or [])}  ",
+           f"**Done when:** {plan.get('done_when')}"]
+    out += [f"- {s.get('description')}" for s in plan.get("steps") or []]
+    return out + [""]
+
+
 def dry_run_to_markdown(path: Path) -> str:
     data = json.loads(path.read_text(encoding="utf-8"))
-    settings, stats = data.get("settings", {}), data.get("stats", {})
+    settings = data.get("settings", {})
     out = [f"# Dry run {path.stem}", "",
-           "*Dry run: one decision about the live colony, not acted on.*", "",
-           "**Settings:** " + ", ".join(f"{k} `{v}`" for k, v in settings.items()),
-           f"**Model:** {stats.get('seconds')}s, {stats.get('prompt_tokens')} prompt tokens, "
+           "*Dry run: decisions about the live colony, not acted on.*", "",
+           "**Settings:** " + ", ".join(f"{k} `{v}`" for k, v in settings.items()), ""]
+    parts = [(name, data[name]) for name in ("overview", "focus", "threat", "turn") if name in data]
+    for name, part in parts or [("decision", data)]:
+        if parts:
+            out += [f"# {name.capitalize()}", ""]
+        out += part_to_markdown(part)
+    return "\n".join(out)
+
+
+def part_to_markdown(data: dict) -> list[str]:
+    stats = data.get("stats") or {}
+    out = [f"**Model:** {stats.get('seconds')}s, {stats.get('prompt_tokens')} prompt tokens, "
            f"{stats.get('output_tokens')} output tokens", ""]
     decision = data.get("decision")
-    if decision:
+    if decision and "goal" in decision:
+        out += ["## Plan (valid)", ""] + describe_plan({"objective": decision["goal"], **decision})
+    elif decision:
         if "actions" in decision:
-            out += [f"## Turn: {decision.get('time', 'legacy')} (valid)", ""]
+            out += [f"## Turn: {decision.get('time', 'legacy')}"
+                    + (f", plan {decision['plan']}" if decision.get("plan") else "") + " (valid)", ""]
             for action in decision["actions"]:
                 out += [f"**{action['action']}**: {action.get('reason', '')}", ""]
                 out += describe_targets(action) + [""]
@@ -220,7 +266,7 @@ def dry_run_to_markdown(path: Path) -> str:
                 "**Reply was:**", "", f"`{data.get('reply')}`", ""]
     out += block(data.get("thinking"), "Model reasoning")
     out += block(data.get("prompt"), "Full prompt sent to the model")
-    return "\n".join(out)
+    return out
 
 
 def convert(path: Path) -> Path:

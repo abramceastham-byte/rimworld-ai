@@ -36,11 +36,46 @@ def usable_stuff(items) -> dict[str, int]:
     return {m: allowed[m] for m in ALL_STUFF if allowed.get(m)}
 
 
+def unlockable_stuff(items) -> dict[str, int]:
+    """Building materials lying forbidden: one allow_items away from usable."""
+    forbidden = stock_by_def(items, True)
+    usable = usable_stuff(items)
+    return {m: forbidden[m] for m in ALL_STUFF if forbidden.get(m) and not usable.get(m)}
+
+
 def listed(totals: dict[str, int], limit: int = 24) -> str:
     """e.g. "Steel 480, WoodLog 220", biggest first."""
     top = sorted(totals.items(), key=lambda kv: -kv[1])[:limit]
     more = f", and {len(totals) - limit} more kinds" if len(totals) > limit else ""
     return ", ".join(f"{name} {n}" for name, n in top) + more if top else "nothing"
+
+
+CHUNKS = tuple(f"Chunk{s}" for s in STONES)
+CHUNK_NOTE = ("clutter, not building material: a stonecutter's table can cut them into stone blocks, "
+              f"{BLOCKS_PER_CHUNK} per chunk")
+
+
+class ItemLister:
+    """listed(), with stone chunks set apart and explained beside them.
+
+    The overview showed "ChunkSandstone 559" in the stock lines but not the
+    line explaining chunks, and a model planned a bedroom "using ChunkSandstone,
+    ChunkSlate, ChunkGranite". The full note goes with the first line listing
+    chunks, a short one after: repeated stonecutter advice once made a model
+    plan ten stonecutter's tables.
+    """
+
+    def __init__(self) -> None:
+        self.explained = False
+
+    def __call__(self, totals: dict[str, int]) -> str:
+        chunks = {name: n for name, n in totals.items() if name in CHUNKS}
+        if not chunks:
+            return listed(totals)
+        rest = {name: n for name, n in totals.items() if name not in CHUNKS}
+        note = CHUNK_NOTE if not self.explained else "clutter, not building material"
+        self.explained = True
+        return (f"{listed(rest)}; " if rest else "") + f"stone chunks ({note}): {listed(chunks)}"
 
 
 def how_to_get(stuff: str) -> str:
@@ -64,6 +99,7 @@ def describe_supplies(items, stored=None, tables=(), finished_research=frozenset
     is already spoken for.
     """
     lines = []
+    items_listed = ItemLister()
     if stored is not None:
         # Only stored things that are also loose items on the map: RIMAPI's
         # storage read also returns plants growing in stockpile cells, and
@@ -71,19 +107,27 @@ def describe_supplies(items, stored=None, tables=(), finished_research=frozenset
         stored_ids = {i.thing_id for i in stored}
         in_storage = [i for i in items if i.thing_id in stored_ids]
         lines.append("Colony stock (allowed, in stockpiles and shelves, as the game's resource "
-                     f"readout shows): {listed(stock_by_def(in_storage, False))}.")
+                     f"readout shows): {items_listed(stock_by_def(in_storage, False))}.")
         outside = [i for i in items if i.thing_id not in stored_ids]
         lines.append("Also allowed but outside storage (usable; colonists fetch it): "
-                     f"{listed(stock_by_def(outside, False))}.")
+                     f"{items_listed(stock_by_def(outside, False))}.")
     else:
-        lines.append(f"Allowed items on the map (usable): {listed(stock_by_def(items, False))}.")
-    lines.append(f"Forbidden, unusable until allow_items: {listed(stock_by_def(items, True))}.")
+        lines.append(f"Allowed items on the map (usable): {items_listed(stock_by_def(items, False))}.")
+    lines.append(f"Forbidden, unusable until allow_items: {items_listed(stock_by_def(items, True))}.")
 
     stuff = usable_stuff(items)
     blocks = {m: n for m, n in stuff.items() if m.startswith("Blocks")}
     lines.append("Building materials (stuff) usable now: "
                  + (", ".join(f"{m} {n}" for m, n in stuff.items() if m not in blocks) or "no wood or steel")
                  + "; stone blocks: " + (", ".join(f"{m} {n}" for m, n in blocks.items()) or "none") + ".")
+    locked = unlockable_stuff(items)
+    if locked:
+        # Offered for building all the same: a model with 300 forbidden wood
+        # and no build_room on offer planned a room as 17 single walls.
+        lines.append("Forbidden building materials, offered in the orders all the same: "
+                     + ", ".join(f"{m} {n}" for m, n in locked.items())
+                     + ". Include allow_items (what=all, or the material) in the same reply; blueprints only "
+                       "wait for materials.")
 
     if builds:
         lines.append(describe_commitments(items, stored, builds))
@@ -93,7 +137,7 @@ def describe_supplies(items, stored=None, tables=(), finished_research=frozenset
     if chunks:
         # One mention, only as strong as the situation needs: a model told in
         # four places to build a stonecutter's table planned ten of them.
-        text = f"Stone chunks ({listed(chunks)}) are not building material; build in wood."
+        text = f"Stone chunks ({listed(chunks)}) are clutter, not building material; build in wood."
         if any(t.thing_def == "TableStonecutter" for t in tables):
             text += (f" Your stonecutter's table can cut them into blocks ({BLOCKS_PER_CHUNK} per chunk) "
                      f"with a bill such as Make_StoneBlocks{next(iter(chunks))[5:]}, if you want stone.")

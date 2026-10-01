@@ -33,6 +33,30 @@ class GameEvent(BaseModel):
     tick: int
 
 
+# Letters RimWorld files under Threat that are warnings, not attacks.
+# "Ancient danger": a colonist came near a sealed ancient structure. It holds
+# cryptosleep caskets and may hold sleeping hostiles or mechanoids, which only
+# wake if the structure is opened.
+WARNING_LETTERS = {
+    "Ancient danger": ("a sealed ancient structure is nearby. It holds cryptosleep caskets and may hold sleeping "
+                       "hostiles or mechanoids (dormant threats listed may be them). It is not an attack: nothing "
+                       "wakes unless colonists open it (mining or deconstructing its walls, opening a casket). "
+                       "Leave it closed until you are armed and ready to fight; don't build or mine into it."),
+}
+
+
+def is_attack(event: "GameEvent") -> bool:
+    """A threat letter that means enemies are coming, not a warning."""
+    return event.category.startswith("Threat") and event.text not in WARNING_LETTERS
+
+
+def describe_event(event: "GameEvent") -> str:
+    """One prompt line; warning letters say what they mean."""
+    text = f"- {event.kind} ({event.category}): {event.text}"
+    note = WARNING_LETTERS.get(event.text)
+    return text + (f". Meaning: {note}" if note else "")
+
+
 class EventListener:
     def __init__(self, base_url: str | None = None):
         base_url = base_url or load_settings().rimapi_url

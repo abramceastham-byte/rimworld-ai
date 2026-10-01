@@ -95,6 +95,55 @@ The client checks that the recipe is actually available at that table. If the
 same recipe already has a bill, it updates and resumes that bill rather than
 creating a duplicate. Bill deletion is intentionally not exposed to the model.
 
+## Overview, focus and threat prompts (`--loop modes`, the default)
+
+Instead of one prompt with everything, the loop asks three kinds of prompt:
+
+- **Overview:** the colony at a glance. The model writes a plan in its own
+  words (`goal`, up to 6 `steps`, `done_when`) and names 1 to 3 **toolkits**:
+  construction, storage, work, production, farming, research, wood_mining,
+  hunting, power, medical. It gives no orders.
+- **Focus:** the plan plus only what its toolkits need: their orders (the reply
+  schema offers nothing else), the rules for those orders, the map sections and
+  observations they use, and the lessons saved for them. Enabling and disabling
+  work is always offered. The reply is a turn plus `plan` (`continue`, `done`
+  or `replan`), `request_toolkits` (added from the next turn) and an optional
+  `lesson` tagged with a toolkit, so it only shows up in prompts that use that toolkit.
+- **Threat:** while enemies are active: only the enemies (id, kind, position,
+  health), the colonists with their weapons, weapons lying on the map, and
+  combat orders: `draft`, `move`, `attack`, `equip`, `tend`, `bed_rest`, `rescue`.
+  Once the threat is over, drafted colonists are released back to work and the
+  overview is asked again.
+
+The overview comes back when the model says the plan is done or asks to
+replan, after 12 focus turns on one plan, after two turns in a row where every
+order failed, and after a threat. Every prompt starts with the same **vital
+signs**: date, temperature, food in days, each colonist's health, mood, food
+and job (DRAFTED, BADLY HURT, HUNGRY flags), threats, alerts and last turn's
+counts. `--loop single` is the old one-prompt loop, with the orders it had before.
+
+`--steps` counts turns (focus and threat turns; an overview runs within the turn it starts). A run doesn't stop mid-plan: past `--steps` it keeps going until the current plan is done, replanned or out of turns, or the fight is over, but never starts a new plan, and never takes more than 18 extra turns. Drafted colonists are always released when a run ends.
+
+**Base layout** (`rimagent/layout.py`). With `plan_area` (in every building
+toolkit) the model reserves an area for each kind of building: bedrooms,
+kitchen_dining, storage, workshop, research, fields, power, recreation,
+hospital. It is saved in `memory/layout.json` and listed, with what stands in
+each area, in the overview and building prompts. Placing something outside
+its area, or inside another kind's area, gets a HINT. Nothing is refused, and
+planning an area again moves it. Construction and storage prompts also list
+**room slots**: rooms right beside ones already built with `build_room`,
+sharing a wall, checked clear, with the exact `build_room` rectangle and door side.
+
+**connect_power** takes a cell of the power source (generator, battery or one
+of its conduits) and a cell of what needs power. The route is worked out in
+code (`rimagent/power.py`): generators, batteries and conduits carry power to
+whatever touches them, and a building that uses power links to any of them
+within about 6 cells. So a route starts touching the source and ends near the
+target. It uses a plain `PowerConduit` (1 steel) under walls and other buildings and a
+`HiddenConduit` (2 steel) on open ground, and reuses existing conduits. It is
+offered once Electricity is researched and a generator or battery exists (built
+or planned).
+
 ## What the model sees and does each step
 
 A reply is a **turn**: 0 to 10 orders, then a time choice:
@@ -201,7 +250,7 @@ the buildings, floors and crops it may use.
 | `build_wall` | A straight run of walls; taken cells are skipped and named | 20 cells |
 | `build_floor` | Flooring over a rectangle; floored or planned cells are skipped | 225 cells; stone tiles need Stonecutting |
 | `designate` | Mine rock or harvest ripe plants in a rectangle; hunt at one animal cell | Mine: 400 cells (a bigger box would send colonists into the whole mountain). Harvest: any size. Hunt: one animal cell, x1=x2 and z1=z2. Only offered with observed targets |
-| `allow_items` | Unforbid the items in a rectangle | Any size on the map |
+| `allow_items` | Unforbid every forbidden item of a kind (`what` = all, Food or an item def) | Whole map; offered in every toolkit |
 | `chop_trees` | Order the trees in a rectangle cut | Any size; the 30 trees nearest its centre per order (one request each). Trees already ordered are skipped, so repeating an order reports `unchanged` |
 
 RIMAPI does little checking of its own here (unknown names are skipped while it
@@ -271,19 +320,22 @@ With Ollama reachable at `OLLAMA_HOST` (see the SSH tunnel section below):
 ```bash
 # One decision about the live colony, printed and saved to logs/dry-runs/,
 # never acted on. Use it after changing the prompt or to compare models.
-python -m scripts.dry_run qwen3:14b --think on
+python -m scripts.dry_run qwen3:14b --think on            # overview, then a focus turn on its plan
+python -m scripts.dry_run qwen3:14b --toolkits power,construction   # skip the overview
+python -m scripts.dry_run --prompts-only                    # just print the prompts, no model
 
 # A real run: the model plays for 20 steps.
 python -m scripts.run_agent --model gpt-oss:20b --think medium --steps 20
 python -m scripts.run_agent --model qwen3:14b --think on --steps 20
+python -m scripts.run_agent --model qwen3:14b --think on --steps 20 --loop single   # the old loop
 ```
 
 **Every turn chooses time.** The game is always paused while the model decides
 and while its orders run. Then:
 
-- **advance:** the game runs for `--run-seconds` of *game* time (default 48,
-  measured at normal speed: 2,880 ticks, 1.15 in-game hours, 8 real seconds at
-  speed 3), or `--threat-run-seconds` (default 14.4) while a
+- **advance:** the game runs for `--run-seconds` of *game* time (default 62.5,
+  measured at normal speed: 3,750 ticks, 1.5 in-game hours, about 10.4 real
+  seconds at speed 3), or `--threat-run-seconds` (default 18.75) while a
   threat is active, then pauses for the next turn. The window is counted in game
   ticks, so `--speed` only changes how long you wait: RimWorld runs 60 ticks/s
   at speed 1, 180 at speed 2 and 360 at speed 3, so `--run-seconds 15 --speed 2`

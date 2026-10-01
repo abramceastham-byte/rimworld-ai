@@ -25,3 +25,18 @@ def make_fake_model(answers: Iterable[str] = DEFAULT_ANSWERS) -> Callable[[str],
         return next(cycle)
 
     return fake_model
+
+
+def make_fake_modes_model() -> Callable[[str], str]:
+    """A stand-in for the overview/focus/threat loop: a fixed plan, then waiting."""
+    overview = json.dumps({"goal": "Watch the colony", "steps": [], "toolkits": ["work"],
+                           "done_when": "never; this is a test"})
+
+    def fake_model(prompt: str) -> str:
+        if "Toolkits (each brings" in prompt:
+            return overview
+        if "THREAT:" in prompt:
+            return json.dumps({"actions": [], "time": "advance"})
+        return json.dumps({"actions": [], "time": "advance", "plan": "continue"})
+
+    return fake_model
