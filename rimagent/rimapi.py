@@ -26,6 +26,7 @@ from rimagent.construction import (
     Rect,
     TerrainInfo,
     TerrainMap,
+    WALL_MOUNTED,
     footprint,
     is_tree,
     room_layout,
@@ -928,7 +929,11 @@ class RimApiClient:
         # Buildings are fine inside stockpiles (shelves belong there), but would
         # eat into a growing zone.
         fields = [i for i in check.zones if i.zone_type != "Stockpile"]
-        blocking = check.terrain + check.ores + check.buildings + fields
+        buildings = check.buildings
+        if def_name in WALL_MOUNTED:
+            # A cooler or vent replaces the wall it is built over.
+            buildings = [b for b in buildings if b.def_name != "Wall"]
+        blocking = check.terrain + check.ores + buildings + fields
         if blocking:
             raise ValueError(
                 f"{def_name} at ({x},{z}) facing {rotation} covers {area}, which is blocked by "

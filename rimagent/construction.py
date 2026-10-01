@@ -104,6 +104,10 @@ BUILDINGS = {
     "Stool": BuildSpec("stool", stuff=("Metallic", "Woody", "Stony"), stuff_count=25),
     "DiningChair": BuildSpec("dining chair", stuff=("Metallic", "Woody"), research="ComplexFurniture", stuff_count=45),
     "PassiveCooler": BuildSpec("passive cooler", research="PassiveCooler", cost=(("WoodLog", 50),)),
+    # The rest of the Architect's Temperature tab; costs from the game's own defs.
+    "Heater": BuildSpec("heater", research="Electricity", cost=(("Steel", 50), ("ComponentIndustrial", 1))),
+    "Cooler": BuildSpec("cooler", research="AirConditioning", cost=(("Steel", 90), ("ComponentIndustrial", 3))),
+    "Vent": BuildSpec("vent", research="AirConditioning", cost=(("Steel", 30),)),
     "WoodFiredGenerator": BuildSpec("wood-fired generator", size=(2, 2), research="Electricity", cost=(("Steel", 100), ("ComponentIndustrial", 2))),
     "StandingLamp": BuildSpec("standing lamp", research="Electricity", cost=(("Steel", 20),)),
     "Barricade": BuildSpec("barricade", stuff=("Metallic", "Woody", "Stony"), stuff_count=5),
@@ -119,6 +123,9 @@ BUILDINGS = {
     "Battery": BuildSpec("battery", size=(1, 2), research="Batteries", cost=(("Steel", 70), ("ComponentIndustrial", 2))),
 }
 
+# Built into a wall: placed over a finished wall cell, which they replace.
+WALL_MOUNTED = ("Cooler", "Vent")
+
 # What each building is for, shown in the buildable list. A model took the
 # stonecutter's table for a "mining table" that would let colonists mine steel.
 BUILDING_USE = {
@@ -132,7 +139,11 @@ BUILDING_USE = {
     "WoodFiredGenerator": "makes power; burns wood as fuel; needs conduits to what it powers",
     "StandingLamp": "light; needs power",
     "TorchLamp": "light; burns wood as fuel; research does not need it",
-    "PassiveCooler": "cools a room; burns wood as fuel",
+    "PassiveCooler": "cools a room a little; burns wood as fuel; can't get cold enough to keep food",
+    "Heater": "heats the room it stands in to a set temperature; needs power",
+    "Cooler": ("goes in a wall cell (built over an existing wall): cold air out the side it faces (rotation), "
+               "hot air out the back, so face it into the room to cool; makes a walk-in freezer; needs power"),
+    "Vent": "goes in a wall cell (built over an existing wall): evens out temperature between two rooms; no power",
     "Campfire": "cooks simple meals and gives heat; burns wood as fuel",
     "Barricade": "defense: cover that drafted colonists shoot from behind; clears the Need defenses alert",
     "TrapSpike": ("defense: hurts the first enemy to step on it; never next to another trap; clears the Need "
