@@ -7,6 +7,7 @@ reachable at OLLAMA_HOST (e.g. through the SSH tunnel in the README).
     python -m scripts.run_agent --model qwen3:14b --think on --steps 20
     python -m scripts.run_agent --model gpt-oss:20b --think medium --steps 20
     python -m scripts.run_agent --model qwen3:14b --loop single   # the old one-prompt loop
+    python -m scripts.run_agent --provider claude-cli --model opus --steps 20   # Claude on your plan
 
 --loop modes (the default) asks an overview prompt for a plan and its toolkits,
 then focus prompts showing only those toolkits, and a threat prompt during a fight.
@@ -21,6 +22,7 @@ import argparse
 import httpx
 
 from rimagent.agent import RUN_TICKS, THREAT_RUN_TICKS, TICKS_PER_SECOND, Turn, run
+from rimagent.claude_cli_model import ClaudeCliModel
 from rimagent.events import EventListener
 from rimagent.fake_model import make_fake_model, make_fake_modes_model
 from rimagent.ollama_model import OllamaModel, parse_think
@@ -30,7 +32,12 @@ from rimagent.runlog import RunLogger
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the RimWorld agent.")
-    parser.add_argument("--model", help="Ollama model name, e.g. qwen3:14b. Omit to use the fake model.")
+    parser.add_argument("--provider", choices=("ollama", "claude-cli"), default="ollama",
+                        help="ollama (default), or claude-cli: Claude through `claude -p` on your Claude plan.")
+    parser.add_argument("--model", help="Ollama model name, e.g. qwen3:14b, or with --provider claude-cli a Claude "
+                                        "alias (opus, sonnet, haiku). Omit to use the fake model.")
+    parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
+                        help="claude-cli only: reasoning effort. Default: the model's own.")
     parser.add_argument("--think", help="on/off (qwen3) or low/medium/high (gpt-oss). Default: the model's own.")
     parser.add_argument("--steps", type=int, help="Turns to take (default: 3 fake, 10 real). With --loop modes the run "
                              "finishes the plan or fight in hand before stopping (up to 18 extra turns).")
@@ -49,7 +56,12 @@ def main() -> None:
                         help="Don't force the reply to match each turn's JSON schema.")
     args = parser.parse_args()
 
-    if args.model:
+    if args.model and args.provider == "claude-cli":
+        model = ClaudeCliModel(args.model, effort=args.effort,
+                               schema=None if args.no_schema else Turn.model_json_schema())
+        info, label = model.describe(), model.label()
+        steps = args.steps or 10
+    elif args.model:
         model = OllamaModel(
             args.model,
             schema=None if args.no_schema else Turn.model_json_schema(),
